@@ -1,24 +1,26 @@
 import base64
+import hashlib
+import hmac
 import os
 from typing import Optional, Tuple
 
 from cryptography.hazmat.backends import default_backend
-from cryptography.hazmat.primitives import hashes, serialization
-from cryptography.hazmat.primitives.asymmetric import rsa
+from cryptography.hazmat.primitives import hashes, hmac as crypto_hmac, serialization
+from cryptography.hazmat.primitives.asymmetric import padding, rsa
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from cryptography.hazmat.primitives.kdf.hkdf import HKDF
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
 
 class CryptoUtils:
-    """Standardized cryptographic utility class for SecureCrypt Vault."""
+    """
+    Standardized cryptographic utility class for the SecureCrypt Vault.
 
-    @staticmethod
-    def b64e(data: bytes) -> str:
-        return base64.b64encode(data).decode("utf-8")
-
-    @staticmethod
-    def b64d(data: str) -> bytes:
-        return base64.b64decode(data.encode("utf-8"))
+    - Asymmetric: RSA (OAEP / RSA-PSS)
+    - Symmetric: AES-256-GCM (AEAD)
+    - Hashing: SHA-256
+    - KDF: PBKDF2 and Argon2id (for newer paths)
+    """
 
     @staticmethod
     def generate_salt(length: int = 16) -> bytes:
@@ -46,9 +48,14 @@ class CryptoUtils:
         lanes: int = 4,
         memory_cost: int = 65536,
     ) -> bytes:
-        """Argon2id key derivation with fallback to argon2-cffi."""
+        """
+        Argon2id key derivation.
+
+        Uses cryptography Argon2id when available, with fallback to argon2-cffi.
+        """
         try:
             from cryptography.hazmat.primitives.kdf.argon2 import Argon2id
+
             kdf = Argon2id(
                 salt=salt,
                 length=length,
@@ -58,7 +65,9 @@ class CryptoUtils:
             )
             return kdf.derive(passphrase.encode("utf-8"))
         except Exception:
+            # Fallback path
             from argon2.low_level import Type, hash_secret_raw
+
             return hash_secret_raw(
                 secret=passphrase.encode("utf-8"),
                 salt=salt,
@@ -70,48 +79,39 @@ class CryptoUtils:
             )
 
     @staticmethod
-    def generate_rsa_key_pair(key_size: int = 2048):
-        return rsa.generate_private_key(
-            public_exponent=65537,
-            key_size=key_size,
-            backend=default_backend()
+    def hkdf_expand(
+        ikm: bytes,
+        *,
+        info: bytes,
+        salt: Optional[bytes] = None,
+        length: int = 32,
+    ) -> bytes:
+        """Derive a context-separated sub-key using HKDF-SHA256."""
+        hkdf = HKDF(
+            algorithm=hashes.SHA256(),
+            length=length,
+            salt=salt,
+            info=info,
+            backend=default_backend(),
         )
+        return hkdf.derive(ikm)
 
     @staticmethod
-    def serialize_private_key(private_key, passphrase=None) -> bytes:
-        encryption = serialization.NoEncryption()
-        if passphrase:
-            encryption = serialization.BestAvailableEncryption(passphrase.encode())
-        return private_key.private_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PrivateFormat.PKCS8,
-            encryption_algorithm=encryption,
+        @staticmethod
+    def hkdf_expand(
+        ikm: bytes,
+        *,
+        info: bytes,
+        salt: Optional[bytes] = None,
+        length: int = 32,
+    ) -> bytes:
+        """Derive a context-separated sub-key using HKDF-SHA256."""
+        from cryptography.hazmat.primitives.kdf.hkdf import HKDF
+        hkdf = HKDF(
+            algorithm=hashes.SHA256(),
+            length=length,
+            salt=salt,
+            info=info,
+            backend=default_backend(),
         )
-
-    @staticmethod
-    def serialize_public_key(public_key) -> bytes:
-        return public_key.public_bytes(
-            encoding=serialization.Encoding.PEM,
-            format=serialization.PublicFormat.SubjectPublicKeyInfo,
-        )
-
-    @staticmethod
-    def load_private_key(data: bytes, passphrase=None):
-        pw = passphrase.encode() if passphrase else None
-        return serialization.load_pem_private_key(data, password=pw, backend=default_backend())
-
-    @staticmethod
-    def load_public_key(data: bytes):
-        return serialization.load_pem_public_key(data, backend=default_backend())
-
-    @staticmethod
-    def encrypt_aes_gcm(plaintext: bytes, key: bytes, associated_data: bytes = None) -> Tuple[bytes, bytes]:
-        aesgcm = AESGCM(key)
-        nonce = os.urandom(12)
-        ciphertext = aesgcm.encrypt(nonce, plaintext, associated_data)
-        return nonce, ciphertext
-
-    @staticmethod
-    def decrypt_aes_gcm(ciphertext: bytes, key: bytes, nonce: bytes, associated_data: bytes = None) -> bytes:
-        aesgcm = AESGCM(key)
-        return aesgcm.decrypt(nonce, ciphertext, associated_data)
+        return hkdf.derive(ikm)
