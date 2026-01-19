@@ -228,3 +228,22 @@ class CryptoUtils:
             return False
 
     @staticmethod
+    def generate_ephemeral_ecdh_keys():
+        """Generate X25519 private key for ephemeral ECDH."""
+        from cryptography.hazmat.primitives.asymmetric import x25519
+
+        return x25519.X25519PrivateKey.generate()
+
+    @staticmethod
+    def derive_shared_secret(private_key, peer_public) -> bytes:
+        """Derive shared secret using X25519 ECDH."""
+        from cryptography.hazmat.primitives.asymmetric import x25519
+
+        if isinstance(peer_public, x25519.X25519PublicKey):
+            peer_public_key = peer_public
+        else:
+            peer_public_key = x25519.X25519PublicKey.from_public_bytes(peer_public)
+
+        return private_key.exchange(peer_public_key)
+
+    @staticmethod
