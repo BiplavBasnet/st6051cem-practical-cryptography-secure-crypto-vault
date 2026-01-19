@@ -247,3 +247,50 @@ class CryptoUtils:
         return private_key.exchange(peer_public_key)
 
     @staticmethod
+    def validate_input(input_str, field_type="general"):
+        """Security validation for user inputs to prevent injection/XSS."""
+        import re
+
+        patterns = {
+            "username": (r"^[a-zA-Z0-9_\-]{3,30}$", "Username must be 3-30 alphanumeric characters."),
+            "email": (r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$", "Invalid email format."),
+            "service": (r"^[a-zA-Z0-9_\-\. ]{1,50}$", "Service name must be 1-50 safe characters."),
+            "general": (r"^[a-zA-Z0-9_\-\. ]*$", "Input contains invalid characters."),
+        }
+        pattern, msg = patterns.get(field_type, patterns["general"])
+        if not input_str:
+            return False, "Input cannot be empty."
+        if re.match(pattern, input_str):
+            return True, "Valid"
+        return False, msg
+
+    @staticmethod
+    def wipe_sensitive_data(obj):
+        """Best-effort wipe for mutable buffers."""
+        try:
+            if isinstance(obj, bytearray):
+                for i in range(len(obj)):
+                    obj[i] = 0
+                return True
+            if isinstance(obj, memoryview) and not obj.readonly:
+                obj[:] = b"\x00" * len(obj)
+                return True
+            return False
+        except Exception:
+            return False
+
+    @staticmethod
+    def hash_file(file_path: str) -> str:
+        """Generate SHA-256 hash of a file."""
+        sha256 = hashlib.sha256()
+        with open(file_path, "rb") as f:
+            while True:
+                chunk = f.read(8192)
+                if not chunk:
+                    break
+                sha256.update(chunk)
+        return sha256.hexdigest()
+
+    @staticmethod
+    def generate_pki_nonce(length: int = 32):
+        return os.urandom(length)
