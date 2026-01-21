@@ -7,6 +7,7 @@ from services.app_paths import db_path as app_db_path
 
 class DBManager:
     def __init__(self, db_name: str = "securevault.db"):
+        # If a relative path is provided, store the DB in the per-user app data directory.
         p = Path(db_name)
         self.db_path = (app_db_path(p.name) if not p.is_absolute() else p).resolve()
 
@@ -34,7 +35,8 @@ class DBManager:
         conn = self.get_connection()
         cursor = conn.cursor()
 
-        cursor.execute("""
+        cursor.execute(
+            """
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 username TEXT UNIQUE NOT NULL,
@@ -42,7 +44,45 @@ class DBManager:
                 auth_cert_serial TEXT,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP
             )
-        """)
+            """
+        )
+
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS certificates (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                serial_number TEXT UNIQUE,
+                subject TEXT,
+                issuer TEXT,
+                valid_from DATETIME,
+                valid_to DATETIME,
+                revoked BOOLEAN DEFAULT 0,
+                cert_data TEXT,
+                key_usage TEXT,
+                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+            """
+        )
+
+        cursor.execute(
+            """
+            CREATE TABLE IF NOT EXISTS documents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER,
+                filename TEXT,
+                file_hash TEXT,
+                signature BLOB,
+                signed_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            )
+            """
+        )
+
+        # v2 table used by enhanced document signing flow (multi-sign + bound cert serial + TSA token)
+        cursor.execute(
+            """
 
         conn.commit()
         conn.close()
@@ -59,4 +99,4 @@ class DBManager:
 if __name__ == "__main__":
     db = DBManager()
     db.setup_database()
-    print("Database created successfully.")
+    print("Database and tables created successfully.")
