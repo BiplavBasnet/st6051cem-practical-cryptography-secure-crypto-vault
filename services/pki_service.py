@@ -160,3 +160,63 @@ class PKIService:
 
         cert = builder.sign(ca_key, hashes.SHA256())
         return cert.public_bytes(serialization.Encoding.PEM)
+
+    def validate_certificate(self, cert_pem_bytes, db_manager=None, required_ku=None, required_eku=None):
+        """Validate cert period, issuer, CA signature, revocation, and usage constraints."""
+        cert = x509.load_pem_x509_certificate(cert_pem_bytes)
+        ca_cert = self.get_ca_cert()
+
+        now = datetime.datetime.now(datetime.timezone.utc)
+        if cert.not_valid_before_utc > now or cert.not_valid_after_utc < now:
+            return False, "Certificate is expired or not yet valid"
+
+        if cert.issuer != ca_cert.subject:
+            return False, "Certificate issuer mismatch"
+
+        try:
+            ca_cert.public_key().verify(
+                cert.signature,
+                cert.tbs_certificate_bytes,
+                padding.PKCS1v15(),
+                cert.signature_hash_algorithm,
+            )
+        except Exception:
+            return False, "Invalid CA signature"
+
+        # Ensure certificate is end-entity cert
+        try:
+            bc = cert.extensions.get_extension_for_class(x509.BasicConstraints).value
+            if bc.ca:
+                return False, "End-entity certificate expected"
+        except x509.ExtensionNotFound:
+            # For strictness, require BasicConstraints
+            return False, "Certificate missing BasicConstraints extension"
+
+        if db_manager:
+            conn = db_manager.get_connection()
+            cursor = conn.cursor()
+            cursor.execute("SELECT revoked FROM certificates WHERE serial_number = ?", (str(cert.serial_number),))
+            row = cursor.fetchone()
+            conn.close()
+            if row and row["revoked"] == 1:
+                return False, "Certificate has been revoked"
+
+        if required_ku:
+            try:
+                ku = cert.extensions.get_extension_for_class(x509.KeyUsage).value
+                for attr in required_ku:
+                    if not getattr(ku, attr):
+                        return False, f"Certificate lacks required KeyUsage: {attr}"
+            except Exception:
+                return False, "Certificate missing KeyUsage extension"
+
+        if required_eku:
+            try:
+                eku = cert.extensions.get_extension_for_class(x509.ExtendedKeyUsage).value
+                for required_oid in required_eku:
+                    if required_oid not in eku:
+                        return False, f"Certificate lacks required ExtendedKeyUsage: {required_oid}"
+            except Exception:
+                return False, "Certificate missing ExtendedKeyUsage extension"
+
+        return True, "Valid"
