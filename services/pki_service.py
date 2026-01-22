@@ -81,3 +81,82 @@ class PKIService:
 
     def get_ca_key(self):
         return CryptoUtils.load_private_key(self.ca_key_path.read_bytes())
+
+    def issue_user_certificate(self, username, public_key, purpose="auth"):
+        """
+        Issue end-entity X.509 certificate with purpose-constrained key usages.
+        purpose: 'auth' | 'signing' | 'encryption'
+        """
+        ca_cert = self.get_ca_cert()
+        ca_key = self.get_ca_key()
+
+        subject = x509.Name([
+            x509.NameAttribute(NameOID.COUNTRY_NAME, "NP"),
+            x509.NameAttribute(NameOID.ORGANIZATION_NAME, "SecureCrypt Vault"),
+            x509.NameAttribute(NameOID.COMMON_NAME, username),
+        ])
+
+        builder = (
+            x509.CertificateBuilder()
+            .subject_name(subject)
+            .issuer_name(ca_cert.subject)
+            .public_key(public_key)
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(datetime.datetime.now(datetime.timezone.utc))
+            .not_valid_after(datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=365))
+            .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        )
+
+        if purpose == "auth":
+            builder = builder.add_extension(
+                x509.KeyUsage(
+                    digital_signature=True,
+                    content_commitment=False,
+                    key_encipherment=False,
+                    data_encipherment=False,
+                    key_agreement=True,
+                    key_cert_sign=False,
+                    crl_sign=False,
+                    encipher_only=False,
+                    decipher_only=False,
+                ),
+                critical=True,
+            ).add_extension(
+                x509.ExtendedKeyUsage([x509.oid.ExtendedKeyUsageOID.CLIENT_AUTH]),
+                critical=False,
+            )
+        elif purpose == "signing":
+            builder = builder.add_extension(
+                x509.KeyUsage(
+                    digital_signature=True,
+                    content_commitment=True,
+                    key_encipherment=False,
+                    data_encipherment=False,
+                    key_agreement=False,
+                    key_cert_sign=False,
+                    crl_sign=False,
+                    encipher_only=False,
+                    decipher_only=False,
+                ),
+                critical=True,
+            )
+        elif purpose == "encryption":
+            builder = builder.add_extension(
+                x509.KeyUsage(
+                    digital_signature=False,
+                    content_commitment=False,
+                    key_encipherment=True,
+                    data_encipherment=True,
+                    key_agreement=False,
+                    key_cert_sign=False,
+                    crl_sign=False,
+                    encipher_only=False,
+                    decipher_only=False,
+                ),
+                critical=True,
+            )
+        else:
+            raise ValueError("Invalid certificate purpose")
+
+        cert = builder.sign(ca_key, hashes.SHA256())
+        return cert.public_bytes(serialization.Encoding.PEM)
