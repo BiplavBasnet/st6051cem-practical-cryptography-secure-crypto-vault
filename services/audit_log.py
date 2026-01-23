@@ -83,3 +83,108 @@ class AuditLog:
                 return False
             finally:
                 conn.close()
+
+    def list_events(
+        self,
+        limit: int = 500,
+        since_ts: Optional[str] = None,
+        until_ts: Optional[str] = None,
+        sort_by: str = "created_at",
+        sort_desc: bool = True,
+        user_id: Optional[int] = None,
+        include_system: bool = False,
+    ) -> List[Dict[str, Any]]:
+        """Read audit log rows for the viewer. When user_id is set, only events for that user (and optionally system) are returned."""
+        conn = self.db.get_connection()
+        try:
+            cursor = conn.cursor()
+            where_parts = []
+            params: List[Any] = []
+            if user_id is not None:
+                if include_system:
+                    where_parts.append("(user_id = ? OR user_id IS NULL)")
+                    params.append(user_id)
+                else:
+                    where_parts.append("user_id = ?")
+                    params.append(user_id)
+            if since_ts:
+                where_parts.append("created_at >= ?")
+                params.append(since_ts)
+            if until_ts:
+                where_parts.append("created_at <= ?")
+                params.append(until_ts)
+            where_sql = (" WHERE " + " AND ".join(where_parts)) if where_parts else ""
+            order_col = "created_at" if sort_by == "created_at" else sort_by
+            if order_col not in ("id", "user_id", "event_type", "created_at"):
+                order_col = "created_at"
+            direction = "DESC" if sort_desc else "ASC"
+            params.append(limit)
+            cursor.execute(
+                f"""
+                SELECT id, user_id, event_type, details, created_at
+                FROM audit_logs
+                {where_sql}
+                ORDER BY {order_col} {direction}
+                LIMIT ?
+                """,
+                params,
+            )
+            rows = cursor.fetchall()
+            out = []
+            for r in rows:
+                details = {}
+                if r["details"]:
+                    try:
+                        details = json.loads(r["details"]) if isinstance(r["details"], str) else r["details"]
+                    except Exception:
+                        details = {}
+                if not isinstance(details, dict):
+                    details = {"value": details}
+                out.append({
+                    "id": r["id"],
+                    "user_id": r["user_id"],
+                    "event_type": r["event_type"] or "",
+                    "details": details,
+                    "created_at": r["created_at"] or "",
+                })
+            return out
+        finally:
+            conn.close()
+
+    def verify_integrity(self):
+        """Verifies the entire hash chain for consistency."""
+        conn = self.db.get_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute("SELECT * FROM audit_logs ORDER BY id ASC")
+            rows = cursor.fetchall()
+
+            expected_prev_hash = "0" * 64
+
+            for row in rows:
+                # Verify continuity first
+                if row["prev_hash"] != expected_prev_hash:
+                    return False, f"Break in chain at ID {row['id']}: Continuity error"
+
+                # Rebuild hash from persisted row values
+                try:
+                    details = json.loads(row["details"]) if row["details"] else {}
+                except Exception:
+                    return False, f"Tamper detected at ID {row['id']}: Invalid details JSON"
+
+                recalculated_hash = self._compute_hash(
+                    event_type=row["event_type"],
+                    details=details,
+                    user_id=row["user_id"],
+                    prev_hash=row["prev_hash"],
+                    created_at=row["created_at"],
+                )
+
+                if row["event_hash"] != recalculated_hash:
+                    return False, f"Tamper detected at ID {row['id']}: Content mismatch"
+
+                expected_prev_hash = row["event_hash"]
+
+            return True, "Audit chain integrity verified"
+        finally:
+            conn.close()
