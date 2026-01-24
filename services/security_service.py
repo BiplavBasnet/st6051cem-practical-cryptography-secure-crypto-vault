@@ -194,3 +194,103 @@ class SecurityService:
         return True, ""
 
     # ── Password policy ───────────────────────────────────────────────
+
+    def validate_password(self, password):
+        if len(password) < 12:
+            return False, "Minimum 12 characters required"
+        if not re.search(r"[A-Z]", password):
+            return False, "Requires uppercase letter"
+        if not re.search(r"[a-z]", password):
+            return False, "Requires lowercase letter"
+        if not re.search(r"[0-9]", password):
+            return False, "Requires number"
+        if not re.search(r"[^A-Za-z0-9]", password):
+            return False, "Requires special character"
+        return True, "Strong password"
+
+    def calculate_strength(self, password):
+        score = 0
+        reasons = []
+        if len(password) >= 16:
+            score += 2
+        elif len(password) >= 12:
+            score += 1
+        else:
+            reasons.append("Too short (< 12 chars)")
+        if re.search(r"[A-Z]", password):
+            score += 1
+        else:
+            reasons.append("No uppercase letter")
+        if re.search(r"[a-z]", password):
+            score += 1
+        else:
+            reasons.append("No lowercase letter")
+        if re.search(r"[0-9]", password):
+            score += 1
+        else:
+            reasons.append("No digit")
+        if re.search(r"[^A-Za-z0-9]", password):
+            score += 1
+        else:
+            reasons.append("No special character")
+        # Check common patterns
+        if re.search(r"(.)\1{2,}", password):
+            score = max(0, score - 1)
+            reasons.append("Repeated characters")
+        if re.search(r"(012|123|234|345|456|567|678|789|abc|bcd|cde|def)", password.lower()):
+            score = max(0, score - 1)
+            reasons.append("Sequential pattern")
+        return min(score, 4), reasons
+
+    # ── Insecure credential flags ─────────────────────────────────────
+
+    @staticmethod
+    def check_insecure_flags(password: str, username: str = "", service: str = "") -> list:
+        """Detect insecure credential patterns. Returns list of warning strings."""
+        flags = []
+        if len(password) < 8:
+            flags.append("Extremely short password (< 8 characters)")
+        if username and password.lower() == username.lower():
+            flags.append("Password identical to username")
+        if service and password.lower() == service.lower():
+            flags.append("Password identical to service name")
+        if username and username.lower() in password.lower():
+            flags.append("Password contains username")
+        return flags
+
+    # ── Phishing / lookalike domain detection (offline) ───────────────
+
+    @staticmethod
+    def _levenshtein(a: str, b: str) -> int:
+        """Compute Levenshtein edit distance between two strings."""
+        if len(a) < len(b):
+            return SecurityService._levenshtein(b, a)
+        if len(b) == 0:
+            return len(a)
+        prev = list(range(len(b) + 1))
+        for i, ca in enumerate(a):
+            curr = [i + 1]
+            for j, cb in enumerate(b):
+                curr.append(min(prev[j + 1] + 1, curr[j] + 1, prev[j] + (0 if ca == cb else 1)))
+            prev = curr
+        return prev[-1]
+
+    @staticmethod
+    def check_lookalike_domain(new_domain: str, existing_domains: list) -> list:
+        """Warn if new_domain is suspiciously similar to an existing saved domain.
+
+        Returns list of (existing_domain, distance) tuples for likely lookalikes.
+        """
+        warnings = []
+        if not new_domain:
+            return warnings
+        nd = new_domain.lower().replace("www.", "")
+        for existing in existing_domains:
+            ed = existing.lower().replace("www.", "")
+            if nd == ed:
+                continue
+            dist = SecurityService._levenshtein(nd, ed)
+            # Flag if edit distance is 1-2 (likely typosquat)
+            if 0 < dist <= 2:
+                warnings.append((existing, dist))
+        return warnings
