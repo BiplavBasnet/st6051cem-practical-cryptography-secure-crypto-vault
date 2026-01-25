@@ -149,3 +149,13 @@ class AuthService:
             return True, "Success"
         finally:
             conn.close()
+
+    def establish_session(self, user_ephemeral_pub_bytes):
+        """Establish a session with Forward Secrecy using ECDH."""
+        server_ephemeral_priv = CryptoUtils.generate_ephemeral_ecdh_keys()
+        server_ephemeral_pub = server_ephemeral_priv.public_key()
+
+        user_ephemeral_pub = serialization.load_pem_public_key(user_ephemeral_pub_bytes)
+        shared_secret = CryptoUtils.derive_shared_secret(server_ephemeral_priv, user_ephemeral_pub)
+
+        return CryptoUtils.serialize_public_key(server_ephemeral_pub), shared_secret
