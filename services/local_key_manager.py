@@ -228,3 +228,34 @@ class LocalKeyManager:
         }
 
     @staticmethod
+    def unlock_key_from_bundle(bundle: dict, login_passphrase: str) -> bytes | None:
+        """Decrypt private key using login passphrase. Supports v1 and v2 bundles."""
+        try:
+            version = str(bundle.get("version") or "1.0")
+            if version.startswith("1"):
+                # legacy format
+                salt = CryptoUtils.b64d(bundle["salt"])
+                nonce = CryptoUtils.b64d(bundle["nonce"])
+                ct = CryptoUtils.b64d(bundle["ciphertext"])
+                kek = CryptoUtils.derive_key_argon2id(login_passphrase, salt)
+                return AESGCM(kek).decrypt(nonce, ct, None)
+
+            login = bundle["login"]
+            kdf = bundle.get("kdf", {})
+            salt = CryptoUtils.b64d(login["salt"])
+            nonce = CryptoUtils.b64d(login["nonce"])
+            ct = CryptoUtils.b64d(login["ciphertext"])
+            aad = (bundle.get("aad") or "sv-keybundle-v2").encode("utf-8")
+
+            root, _ = LocalKeyManager._derive_kek(login_passphrase, salt, kdf)
+            enc_key = CryptoUtils.hkdf_expand(root, info=b"sv:keybundle:enc:v2", salt=salt)
+            mac_key = CryptoUtils.hkdf_expand(root, info=b"sv:keybundle:mac:v2", salt=salt)
+
+            if not CryptoUtils.hmac_compare(login.get("mac", ""), mac_key, nonce + ct + aad):
+                return None
+
+            return AESGCM(enc_key).decrypt(nonce, ct, aad)
+        except Exception:
+            return None
+
+    @staticmethod
