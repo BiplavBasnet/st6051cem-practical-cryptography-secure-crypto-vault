@@ -176,3 +176,55 @@ class LocalKeyManager:
         return kek, cfg
 
     @staticmethod
+    def protect_key_bundle(private_key_pem: bytes, login_passphrase: str, recovery_phrase: str) -> dict:
+        """Encrypt private key bytes into a portable JSON bundle."""
+        # Derive KEK from login phrase
+        login_salt = os.urandom(16)
+        kek_root, kdf_cfg = LocalKeyManager._derive_kek(login_passphrase, login_salt)
+        enc_key = CryptoUtils.hkdf_expand(kek_root, info=b"sv:keybundle:enc:v2", salt=login_salt)
+        mac_key = CryptoUtils.hkdf_expand(kek_root, info=b"sv:keybundle:mac:v2", salt=login_salt)
+
+        nonce = os.urandom(12)
+        aad = b"sv-keybundle-v2"
+        ciphertext = AESGCM(enc_key).encrypt(nonce, private_key_pem, aad)
+        mac_hex = CryptoUtils.hmac_sha256_hex(mac_key, nonce + ciphertext + aad)
+
+        # Recovery wrap with separated context
+        rec_salt = os.urandom(16)
+        rec_root, rec_cfg = LocalKeyManager._derive_kek(recovery_phrase, rec_salt, kdf_cfg)
+        rec_key = CryptoUtils.hkdf_expand(rec_root, info=b"sv:keybundle:recovery:v2", salt=rec_salt)
+        rec_nonce = os.urandom(12)
+        recovery_wrapped = AESGCM(rec_key).encrypt(rec_nonce, kek_root, b"sv-recovery-wrap-v2")
+
+        return {
+            "version": "2.0",
+            "cipher": "AES-256-GCM",
+            "aad": "sv-keybundle-v2",
+            "kdf": {
+                "algorithm": "argon2id",
+                "length": int(kdf_cfg.get("length", 32)),
+                "iterations": int(kdf_cfg.get("iterations", 2)),
+                "lanes": int(kdf_cfg.get("lanes", 4)),
+                "memory_cost": int(kdf_cfg.get("memory_cost", 65536)),
+            },
+            "login": {
+                "salt": CryptoUtils.b64e(login_salt),
+                "nonce": CryptoUtils.b64e(nonce),
+                "ciphertext": CryptoUtils.b64e(ciphertext),
+                "mac": mac_hex,
+            },
+            "recovery": {
+                "salt": CryptoUtils.b64e(rec_salt),
+                "nonce": CryptoUtils.b64e(rec_nonce),
+                "wrapped_kek": CryptoUtils.b64e(recovery_wrapped),
+                "kdf": {
+                    "algorithm": "argon2id",
+                    "length": int(rec_cfg.get("length", 32)),
+                    "iterations": int(rec_cfg.get("iterations", 2)),
+                    "lanes": int(rec_cfg.get("lanes", 4)),
+                    "memory_cost": int(rec_cfg.get("memory_cost", 65536)),
+                },
+            },
+        }
+
+    @staticmethod
