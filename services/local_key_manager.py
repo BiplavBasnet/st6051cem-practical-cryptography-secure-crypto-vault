@@ -259,3 +259,34 @@ class LocalKeyManager:
             return None
 
     @staticmethod
+    def unlock_with_recovery(bundle: dict, recovery_phrase: str) -> bytes | None:
+        """Recover private key using recovery phrase by unwrapping KEK."""
+        try:
+            version = str(bundle.get("version") or "1.0")
+            if version.startswith("1"):
+                return None
+
+            rec = bundle["recovery"]
+            rkdf = rec.get("kdf", bundle.get("kdf", {}))
+            rec_salt = CryptoUtils.b64d(rec["salt"])
+            rec_nonce = CryptoUtils.b64d(rec["nonce"])
+            wrapped = CryptoUtils.b64d(rec["wrapped_kek"])
+
+            rec_root, _ = LocalKeyManager._derive_kek(recovery_phrase, rec_salt, rkdf)
+            rec_key = CryptoUtils.hkdf_expand(rec_root, info=b"sv:keybundle:recovery:v2", salt=rec_salt)
+            kek_root = AESGCM(rec_key).decrypt(rec_nonce, wrapped, b"sv-recovery-wrap-v2")
+
+            login = bundle["login"]
+            login_salt = CryptoUtils.b64d(login["salt"])
+            nonce = CryptoUtils.b64d(login["nonce"])
+            ct = CryptoUtils.b64d(login["ciphertext"])
+            aad = (bundle.get("aad") or "sv-keybundle-v2").encode("utf-8")
+
+            enc_key = CryptoUtils.hkdf_expand(kek_root, info=b"sv:keybundle:enc:v2", salt=login_salt)
+            mac_key = CryptoUtils.hkdf_expand(kek_root, info=b"sv:keybundle:mac:v2", salt=login_salt)
+            if not CryptoUtils.hmac_compare(login.get("mac", ""), mac_key, nonce + ct + aad):
+                return None
+
+            return AESGCM(enc_key).decrypt(nonce, ct, aad)
+        except Exception:
+            return None
