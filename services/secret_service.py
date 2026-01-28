@@ -333,3 +333,123 @@ class SecretService:
             return True, "Secret added successfully"
         except Exception as e:
             return False, f"Failed to add secret: {str(e)}"
+
+    def get_secrets_metadata(self, user_id, search_query=None, sort_column="service_name", sort_direction="ASC"):
+        conn = self.db.get_connection()
+        cursor = conn.cursor()
+
+        # Validate sort column to prevent SQL injection
+        valid_columns = {
+            "service_name": "service_name",
+            "username_email": "username_email",
+            "url": "url",
+            "created_at": "created_at",
+            "id": "id"
+        }
+        sort_col = valid_columns.get(sort_column, "service_name")
+        sort_dir = "ASC" if sort_direction.upper() == "ASC" else "DESC"
+
+        if search_query:
+            # Escape LIKE wildcards so user input is matched literally
+            escaped = (search_query.lower()
+                .replace("\\", "\\\\")
+                .replace("%", "\\%")
+                .replace("_", "\\_"))
+            q = f"%{escaped}%"
+            cursor.execute(
+                f"""
+                SELECT id, service_name, username_email, url, created_at
+                FROM vault_secrets
+                WHERE owner_id = ? AND (
+                    LOWER(service_name) LIKE ? OR
+                    LOWER(username_email) LIKE ? OR
+                    (url IS NOT NULL AND LOWER(url) LIKE ?)
+                )
+                ORDER BY {sort_col} {sort_dir}
+                """,
+                (int(user_id), q, q, q),
+            )
+        else:
+            cursor.execute(
+                f"""
+                SELECT id, service_name, username_email, url, created_at
+                FROM vault_secrets
+                WHERE owner_id = ?
+                ORDER BY {sort_col} {sort_dir}
+                """,
+                (int(user_id),),
+            )
+
+        rows = [dict(row) for row in cursor.fetchall()]
+        conn.close()
+        return rows
+
+    def decrypt_secret(self, user_id, entry_id, priv_key_data):
+        try:
+            conn = self.db.get_connection()
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT encrypted_password, encrypted_dek, nonce,
+                       encrypted_totp, totp_nonce, encrypted_totp_dek,
+                       service_name, username_email, canonical_url, crypto_version
+                FROM vault_secrets
+                WHERE id = ? AND owner_id = ?
+                """,
+                (int(entry_id), int(user_id)),
+            )
+            row = cursor.fetchone()
+            conn.close()
+
+            if not row:
+                return None, "Secret entry not found"
+
+            priv_key = CryptoUtils.load_private_key(priv_key_data)
+
+            version = str(row["crypto_version"] or "")
+            plaintext_bytes = None
+            totp_secret_bytes = None
+
+            # Preferred v3 path with AAD binding
+            if version.startswith("v3"):
+                aad = self._build_entry_aad(row["service_name"], row["username_email"], row["canonical_url"] or "")
+                plaintext_bytes = CryptoUtils.hybrid_decrypt(
+                    priv_key,
+                    row["encrypted_dek"],
+                    row["nonce"],
+                    row["encrypted_password"],
+                    associated_data=aad,
+                )
+                if row["encrypted_totp"] and row["totp_nonce"] and row["encrypted_totp_dek"]:
+                   try:
+                       totp_secret_bytes = CryptoUtils.hybrid_decrypt(
+                           priv_key,
+                           row["encrypted_totp_dek"],
+                           row["totp_nonce"],
+                           row["encrypted_totp"],
+                           associated_data=aad,
+                       )
+                   except Exception:
+                       totp_secret_bytes = None
+            else:
+                # Fallback to v1/v2 (no AAD)
+                plaintext_bytes = CryptoUtils.hybrid_decrypt(
+                    priv_key,
+                    row["encrypted_dek"],
+                    row["nonce"],
+                    row["encrypted_password"],
+                )
+
+            if plaintext_bytes is None:
+                return None, "Decryption failed: password could not be decrypted"
+            
+            pwd = plaintext_bytes.decode("utf-8")
+            totp = totp_secret_bytes.decode("utf-8") if totp_secret_bytes else None
+            
+            # Return both if needed? The UI expect just pwd for now.
+            # I'll modify the API to return a dict or tuple.
+            self.audit.log_event("SECRET_DECRYPTED", {"user_id": user_id, "service": row["service_name"]}, user_id=user_id)
+            return {"password": pwd, "totp_secret": totp}, "Success"
+
+        except Exception as e:
+            return None, f"Decryption failed: {str(e)}"
