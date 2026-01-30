@@ -42,3 +42,39 @@ class TOTPService:
         return cls._hotp(secret_b32, counter)
 
     @classmethod
+    def verify_totp(cls, secret_b32: str, code: str, timestamp: Optional[float] = None) -> bool:
+        """Verify a TOTP code, accepting ±WINDOW periods for clock skew."""
+        if timestamp is None:
+            timestamp = time.time()
+        counter = int(timestamp) // cls.PERIOD
+        for offset in range(-cls.WINDOW, cls.WINDOW + 1):
+            expected = cls._hotp(secret_b32, counter + offset)
+            if hmac.compare_digest(expected, code.strip()):
+                return True
+        return False
+
+    @classmethod
+    def time_remaining(cls, timestamp: Optional[float] = None) -> int:
+        """Seconds remaining until current TOTP code expires."""
+        if timestamp is None:
+            timestamp = time.time()
+        return cls.PERIOD - (int(timestamp) % cls.PERIOD)
+
+    @classmethod
+    def _hotp(cls, secret_b32: str, counter: int) -> str:
+        """HOTP algorithm (RFC 4226)."""
+        key = cls._decode_secret(secret_b32)
+        msg = struct.pack(">Q", counter)
+        digest = hmac.new(key, msg, hashlib.sha1).digest()
+        offset = digest[-1] & 0x0F
+        code_int = struct.unpack(">I", digest[offset:offset + 4])[0] & 0x7FFFFFFF
+        return str(code_int % (10 ** cls.DIGITS)).zfill(cls.DIGITS)
+
+    @staticmethod
+    def build_otpauth_uri(secret_b32: str, account: str, issuer: str = "SecureCryptVault") -> str:
+        """Build otpauth:// URI for QR code generation."""
+        from urllib.parse import quote
+        return (
+            f"otpauth://totp/{quote(issuer)}:{quote(account)}"
+            f"?secret={secret_b32}&issuer={quote(issuer)}&algorithm=SHA1&digits=6&period=30"
+        )
