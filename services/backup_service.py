@@ -572,3 +572,558 @@ class BackupService:
                 return False, str(e), None
             return True, f"Backup saved to {path}", None
         return True, "Backup created", envelope
+
+    def decrypt_backup_package(
+        self,
+        backup_bytes_or_path: Union[bytes, str, Path],
+        recovery_key_or_password: str,
+        mode: str = "recovery_key",
+    ) -> Tuple[bool, str, Optional[Dict]]:
+        """
+        Decrypt and parse backup package. Returns (success, message, payload_dict).
+        payload_dict has 'entries' and 'payload_format'.
+        """
+        try:
+            if isinstance(backup_bytes_or_path, (str, Path)):
+                raw = Path(backup_bytes_or_path).read_bytes()
+            else:
+                raw = backup_bytes_or_path
+            envelope = json.loads(raw.decode("utf-8"))
+        except Exception as e:
+            return False, f"Invalid backup file: {e}", None
+
+        if envelope.get("format_version") != BACKUP_FORMAT_VERSION:
+            return False, "Unsupported backup format version", None
+
+        enc = envelope.get("encryption", {})
+        salt_b64 = enc.get("salt")
+        nonce_b64 = enc.get("nonce")
+        ct_b64 = envelope.get("ciphertext")
+        if not salt_b64 or not nonce_b64 or not ct_b64:
+            return False, "Missing encryption metadata", None
+
+        salt = CryptoUtils.b64d(salt_b64)
+        nonce = CryptoUtils.b64d(nonce_b64)
+        ct = CryptoUtils.b64d(ct_b64)
+        enc_key = self._derive_encryption_key(
+            mode, recovery_key_or_password, salt, skip_password_validation=True
+        )
+        if not enc_key:
+            return False, "Key derivation failed", None
+
+        stored_verifier = envelope.get("key_verifier")
+        if stored_verifier:
+            expected = CryptoUtils.hmac_sha256_hex(enc_key, b"backup_key_verifier")
+            if not hmac.compare_digest(stored_verifier, expected):
+                return False, "Invalid backup recovery key or password", None
+
+        try:
+            from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+            plaintext = AESGCM(enc_key).decrypt(nonce, ct, b"sv_backup_recovery_v1")
+        except Exception:
+            return False, "Decryption failed (wrong key or corrupted data)", None
+
+        try:
+            payload = json.loads(plaintext.decode("utf-8"))
+        except Exception:
+            return False, "Invalid payload structure", None
+
+        if payload.get("payload_format") != PAYLOAD_FORMAT or "entries" not in payload:
+            return False, "Invalid payload format", None
+
+        return True, "OK", payload
+
+    def decrypt_backup_package_auto(
+        self,
+        backup_bytes_or_path: Union[bytes, str, Path],
+        recovery_key_or_password: str,
+    ) -> Tuple[bool, str, Optional[Dict], Optional[str]]:
+        """
+        Decrypt backup by trying recovery key then backup password. No account needed.
+        Returns (success, message, payload_dict or None, mode_used or None).
+        """
+        try:
+            if isinstance(backup_bytes_or_path, (str, Path)):
+                raw = Path(backup_bytes_or_path).read_bytes()
+            else:
+                raw = backup_bytes_or_path
+            envelope = json.loads(raw.decode("utf-8"))
+        except Exception as e:
+            return False, f"Invalid backup file: {e}", None, None
+
+        if envelope.get("format_version") != BACKUP_FORMAT_VERSION:
+            return False, "Unsupported backup format version", None, None
+
+        enc = envelope.get("encryption", {})
+        salt_b64 = enc.get("salt")
+        nonce_b64 = enc.get("nonce")
+        ct_b64 = envelope.get("ciphertext")
+        if not salt_b64 or not nonce_b64 or not ct_b64:
+            return False, "Missing encryption metadata", None, None
+
+        salt = CryptoUtils.b64d(salt_b64)
+        nonce = CryptoUtils.b64d(nonce_b64)
+        ct = CryptoUtils.b64d(ct_b64)
+        stored_verifier = envelope.get("key_verifier")
+        input_str = (recovery_key_or_password or "").strip()
+        if not input_str:
+            return False, "Enter your backup recovery key or backup password.", None, None
+
+        for mode in ("recovery_key", "backup_password"):
+            enc_key = self._derive_encryption_key(
+                mode, input_str, salt, skip_password_validation=True
+            )
+            if not enc_key:
+                continue
+            if stored_verifier:
+                expected = CryptoUtils.hmac_sha256_hex(enc_key, b"backup_key_verifier")
+                if not hmac.compare_digest(stored_verifier, expected):
+                    continue
+            try:
+                from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+                plaintext = AESGCM(enc_key).decrypt(nonce, ct, b"sv_backup_recovery_v1")
+            except Exception:
+                continue
+            try:
+                payload = json.loads(plaintext.decode("utf-8"))
+            except Exception:
+                return False, "Invalid payload structure", None, None
+            if payload.get("payload_format") != PAYLOAD_FORMAT or "entries" not in payload:
+                return False, "Invalid payload format", None, None
+            return True, "OK", payload, mode
+
+        return False, "Invalid backup recovery key or password", None, None
+
+    def validate_backup_package_auto(
+        self,
+        backup_bytes_or_path: Union[bytes, str, Path],
+        recovery_key_or_password: str,
+        user_id: Optional[int] = None,
+    ) -> Tuple[bool, str]:
+        """
+        Validate backup by trying recovery key then backup password. No mode needed.
+        Returns (success, message). Logs backup_validation_* and sets latest_validation_status when user_id given.
+        """
+        self.audit.log_event("backup_validation_started", {}, user_id=user_id)
+        ok, msg, payload, _mode = self.decrypt_backup_package_auto(backup_bytes_or_path, recovery_key_or_password)
+        if ok and payload:
+            self.audit.log_event("backup_validation_success", {"entries": len(payload.get("entries", []))}, user_id=user_id)
+            if user_id is not None:
+                self.set_latest_validation_status(user_id, True)
+            return True, "Backup is valid and can be restored"
+        self.audit.log_event("backup_validation_failed", {"reason": msg}, user_id=user_id)
+        if user_id is not None:
+            self.set_latest_validation_status(user_id, False)
+        return False, msg
+
+    def validate_backup_package(
+        self,
+        backup_bytes_or_path: Union[bytes, str, Path],
+        recovery_key_or_password: str,
+        mode: str = "recovery_key",
+        user_id: Optional[int] = None,
+    ) -> Tuple[bool, str]:
+        """
+        Validate backup envelope and decrypt with given key/password without restoring.
+        Returns (success, message). Logs backup_validation_started, backup_validation_success or backup_validation_failed.
+        If user_id is provided, stores result for dashboard via set_latest_validation_status.
+        """
+        self.audit.log_event("backup_validation_started", {}, user_id=user_id)
+        ok, msg, payload = self.decrypt_backup_package(backup_bytes_or_path, recovery_key_or_password, mode)
+        if ok:
+            self.audit.log_event("backup_validation_success", {"entries": len(payload.get("entries", []))}, user_id=user_id)
+            if user_id is not None:
+                self.set_latest_validation_status(user_id, True)
+            return True, "Backup is valid and can be restored"
+        self.audit.log_event("backup_validation_failed", {"reason": msg}, user_id=user_id)
+        if user_id is not None:
+            self.set_latest_validation_status(user_id, False)
+        return False, msg
+
+    def preview_backup_metadata(
+        self,
+        backup_bytes_or_path: Union[bytes, str, Path],
+    ) -> Tuple[bool, str, Optional[Dict[str, Any]]]:
+        """
+        Phase 4: Return safe metadata from backup envelope without decryption.
+        No secret data. Returns (success, message, metadata_dict or None).
+        """
+        try:
+            if isinstance(backup_bytes_or_path, (str, Path)):
+                raw = Path(backup_bytes_or_path).read_bytes()
+            else:
+                raw = backup_bytes_or_path
+            envelope = json.loads(raw.decode("utf-8"))
+        except Exception as e:
+            return False, f"Invalid backup file: {e}", None
+
+        format_version = envelope.get("format_version")
+        if format_version != BACKUP_FORMAT_VERSION:
+            return False, "Unsupported backup format version", None
+
+        manifest = envelope.get("manifest") or {}
+        meta = {
+            "format_version": format_version,
+            "backup_id": envelope.get("backup_id"),
+            "created_at": envelope.get("created_at"),
+            "user_id": envelope.get("user_id"),
+            "schema_version": envelope.get("schema_version"),
+            "entry_count": manifest.get("entry_count", 0),
+        }
+        return True, "OK", meta
+
+    def resolve_recovery_factor(self, user_id: int, input_str: str) -> Tuple[bool, Optional[str], str]:
+        """
+        Try to validate input as recovery key first, then as backup password.
+        Returns (success, mode_used, error_message).
+        Use this when the UI accepts 'recovery key or backup password' in one field.
+        """
+        if not (input_str or "").strip():
+            return False, None, "Enter your backup recovery key or backup password."
+        cfg = self._get_config(user_id)
+        if not cfg or not cfg["backup_enabled"]:
+            return False, None, "Backup recovery is not enabled."
+        s = input_str.strip()
+        if self._verify_recovery_key(user_id, s):
+            return True, "recovery_key", ""
+        if self._verify_backup_password(user_id, s):
+            return True, "backup_password", ""
+        return False, None, "Invalid backup recovery key or password."
+
+    def set_auto_backup_key_for_session(self, user_id: int, recovery_key_or_password: str, mode: str) -> Tuple[bool, str]:
+        """Store recovery key/password in memory for scheduled/change-triggered backups. Never persisted."""
+        if mode not in ("recovery_key", "backup_password"):
+            return False, "Invalid mode"
+        cfg = self._get_config(user_id)
+        if not cfg or not cfg["backup_enabled"] or cfg["backup_mode"] != mode:
+            return False, "Backup recovery not enabled for this mode"
+        if mode == "recovery_key":
+            if not self._verify_recovery_key(user_id, recovery_key_or_password):
+                return False, "Invalid backup recovery key or password"
+        else:
+            if not self._verify_backup_password(user_id, recovery_key_or_password):
+                return False, "Invalid backup recovery key or password"
+        self._cached_auto_backup_key[user_id] = (recovery_key_or_password, mode)
+        return True, "Auto backup key set for this session"
+
+    def clear_auto_backup_key_for_user(self, user_id: int) -> None:
+        """Clear cached key for user (e.g. on logout)."""
+        self._cached_auto_backup_key.pop(user_id, None)
+        self._pending_change_at.pop(user_id, None)
+
+    def clear_auto_backup_keys(self) -> None:
+        """Clear all cached keys and pending state."""
+        self._cached_auto_backup_key.clear()
+        self._pending_change_at.clear()
+
+    def create_local_backup_now(
+        self,
+        user_id: int,
+        priv_key_data: bytes,
+        reason: str = "manual",
+        recovery_key_or_password: Optional[str] = None,
+        mode: Optional[str] = None,
+    ) -> Tuple[bool, str]:
+        """
+        Create a versioned local backup in app backup dir. reason: 'manual'|'scheduled'|'change'.
+        If recovery_key_or_password/mode are None, uses cached key from set_auto_backup_key_for_session.
+        Phase 5: in-progress guard prevents overlapping backups per user.
+        """
+        if self._backup_in_progress.get(user_id):
+            return False, "Backup already in progress"
+        self._backup_in_progress[user_id] = True
+        try:
+            return self._create_local_backup_now_impl(user_id, priv_key_data, reason, recovery_key_or_password, mode)
+        finally:
+            self._backup_in_progress.pop(user_id, None)
+
+    def _create_local_backup_now_impl(
+        self,
+        user_id: int,
+        priv_key_data: bytes,
+        reason: str,
+        recovery_key_or_password: Optional[str],
+        mode: Optional[str],
+    ) -> Tuple[bool, str]:
+        if reason not in ("manual", "scheduled", "change_triggered"):
+            reason = "manual"
+        key_mode = mode
+        key_or_pass = recovery_key_or_password
+        if key_or_pass is None or key_mode is None:
+            cached = self._cached_auto_backup_key.get(user_id)
+            if not cached:
+                return False, "Provide recovery key/password or set auto backup key for this session"
+            key_or_pass, key_mode = cached
+        envelope, err = self._build_encrypted_envelope(user_id, priv_key_data, key_or_pass, key_mode)
+        if err:
+            if reason != "manual":
+                self.audit.log_event("local_backup_failed", {"user_id": user_id, "reason": reason, "error": err}, user_id=user_id)
+            return False, err
+        backup_dir = self._backup_dir_for_user(user_id)
+        try:
+            backup_dir.mkdir(parents=True, exist_ok=True)
+        except OSError as e:
+            self.audit.log_event("local_backup_failed", {"user_id": user_id, "reason": reason, "error": str(e)}, user_id=user_id)
+            return False, f"Cannot create backup directory: {e}"
+        # Filename: vault_backup_<username>_<YYYY-MM-DD>_<HH-MM-SS-AM/PM>.enc (12-hour, local time)
+        created_str = envelope.get("created_at") or ""
+        try:
+            dt_utc = datetime.datetime.fromisoformat(created_str.replace("Z", "+00:00").strip())
+            # Convert UTC to local time so filename matches user's clock
+            if dt_utc.tzinfo is not None:
+                dt_local = dt_utc.astimezone()
+            else:
+                dt_local = dt_utc
+            dt = dt_local.replace(tzinfo=None)  # naive for strftime
+            date_part = dt.strftime("%Y-%m-%d")
+            hour12 = dt.hour % 12 or 12
+            am_pm = "AM" if dt.hour < 12 else "PM"
+            time_part = f"{hour12:02d}-{dt.minute:02d}-{dt.second:02d}-{am_pm}"
+            ts = f"{date_part}_{time_part}"
+        except Exception:
+            ts = (created_str or "").replace(":", "-").replace("Z", "")[:19].replace("T", "_")
+        username = self._get_username_for_user_id(user_id)
+        safe_username = re.sub(r"[^\w\-.]", "_", username.strip())[:64] or "user"
+        fname = f"vault_backup_{safe_username}_{ts}_{envelope['backup_id']}.enc"
+        out_path = backup_dir / fname
+        try:
+            out_path.write_text(json.dumps(envelope, separators=(",", ":")), encoding="utf-8")
+        except OSError as e:
+            self.audit.log_event("local_backup_failed", {"user_id": user_id, "reason": reason, "error": str(e)}, user_id=user_id)
+            return False, f"Failed to write backup file: {e}"
+        self._update_last_backup(user_id)
+        event_type = {"manual": "local_backup_created_manual", "scheduled": "local_backup_created_scheduled", "change_triggered": "local_backup_created_change_triggered"}.get(reason, "local_backup_created")
+        self.audit.log_event(event_type, {"user_id": user_id, "backup_id": envelope["backup_id"], "path": fname}, user_id=user_id)
+        self._log_backup_event(user_id, "LOCAL_BACKUP_CREATED", {"backup_id": envelope["backup_id"], "reason": reason})
+        latest = {"backup_id": envelope["backup_id"], "path": fname, "created_at": envelope["created_at"], "entry_count": envelope["manifest"]["entry_count"]}
+        try:
+            (backup_dir / LATEST_FILENAME).write_text(json.dumps(latest, separators=(",", ":")), encoding="utf-8")
+        except Exception:
+            pass
+        manifest_path = backup_dir / MANIFEST_FILENAME
+        try:
+            history = []
+            if manifest_path.exists():
+                try:
+                    history = json.loads(manifest_path.read_text(encoding="utf-8"))
+                except Exception:
+                    history = []
+            if not isinstance(history, list):
+                history = []
+            history.append({"backup_id": envelope["backup_id"], "path": fname, "created_at": envelope["created_at"], "reason": reason})
+            manifest_path.write_text(json.dumps(history[-50:], separators=(",", ":")), encoding="utf-8")
+        except Exception:
+            pass
+        pruned = self.prune_local_backups(user_id)
+        if pruned:
+            self.audit.log_event("local_backup_pruned", {"user_id": user_id, "count": pruned}, user_id=user_id)
+        if reason == "change_triggered":
+            self._pending_change_at.pop(user_id, None)
+        msg = str(out_path)
+        if pruned:
+            msg += f". Pruned {pruned} old backup(s)."
+        return True, msg
+
+    def list_local_backups(self, user_id: int) -> List[Dict]:
+        """List versioned local backup files for user (timestamp, size, path, backup_id, reason if in manifest)."""
+        backup_dir = self._backup_dir_for_user(user_id)
+        if not backup_dir.exists():
+            return []
+        manifest_path = backup_dir / MANIFEST_FILENAME
+        by_path = {}
+        if manifest_path.exists():
+            try:
+                for e in json.loads(manifest_path.read_text(encoding="utf-8")):
+                    if isinstance(e, dict) and e.get("path"):
+                        by_path[e["path"]] = e
+            except Exception:
+                pass
+        result = []
+        for p in backup_dir.iterdir():
+            if p.is_file() and p.suffix == ".enc" and p.name.startswith("vault_backup_"):
+                try:
+                    stat = p.stat()
+                    created_at = ""
+                    backup_id = ""
+                    reason = ""
+                    if p.name in by_path:
+                        created_at = by_path[p.name].get("created_at", "")
+                        backup_id = by_path[p.name].get("backup_id", "")
+                        reason = by_path[p.name].get("reason", "")
+                    if not created_at:
+                        try:
+                            env = json.loads(p.read_text(encoding="utf-8"))
+                            created_at = env.get("created_at", "")
+                            backup_id = env.get("backup_id", "")
+                        except Exception:
+                            pass
+                    result.append({
+                        "path": str(p),
+                        "filename": p.name,
+                        "size": stat.st_size,
+                        "created_at": created_at,
+                        "backup_id": backup_id or p.stem,
+                        "reason": reason,
+                    })
+                except OSError:
+                    continue
+        result.sort(key=lambda x: x.get("created_at") or "", reverse=True)
+        return result
+
+    def prune_local_backups(self, user_id: int) -> int:
+        """Keep only keep_last_n_backups; delete older. Returns number of files deleted. Never deletes newest."""
+        settings = self.get_backup_settings(user_id)
+        keep_raw = settings.get("keep_last_n_backups", KEEP_LAST_N_DEFAULT)
+        try:
+            keep = max(KEEP_LAST_N_MIN, min(KEEP_LAST_N_MAX, int(keep_raw or KEEP_LAST_N_DEFAULT)))
+        except (TypeError, ValueError):
+            keep = KEEP_LAST_N_DEFAULT
+        if keep < KEEP_LAST_N_MIN:
+            keep = KEEP_LAST_N_MIN
+        backups = self.list_local_backups(user_id)
+        if len(backups) <= keep:
+            return 0
+        to_remove = backups[keep:]
+        deleted = 0
+        for b in to_remove:
+            try:
+                Path(b["path"]).unlink(missing_ok=True)
+                deleted += 1
+            except OSError as e:
+                self.audit.log_event(
+                    "local_backup_prune_delete_failed",
+                    {"user_id": user_id, "path": b.get("filename", ""), "error": str(e)},
+                    user_id=user_id,
+                )
+        return deleted
+
+    def should_run_scheduled_backup(self, user_id: int) -> bool:
+        """True if scheduled backup is enabled and next backup is due."""
+        cfg = self._get_config(user_id)
+        if not cfg or not cfg["backup_enabled"]:
+            return False
+        settings = self.get_backup_settings(user_id)
+        if not settings.get("backup_auto_enabled"):
+            return False
+        last = cfg.get("last_backup_at")
+        interval_hours = settings.get("schedule_interval_hours", SCHEDULE_INTERVAL_DEFAULT_HOURS)
+        if last is None:
+            return True
+        try:
+            if isinstance(last, str):
+                last_dt = datetime.datetime.fromisoformat(last.replace("Z", "").strip())
+            else:
+                last_dt = last
+            if last_dt.tzinfo:
+                now = datetime.datetime.now(last_dt.tzinfo)
+            else:
+                now = datetime.datetime.utcnow()
+                if last_dt.tzinfo is None:
+                    last_dt = last_dt.replace(tzinfo=None)
+            delta = datetime.timedelta(hours=float(interval_hours))
+            next_due = last_dt + delta
+            return now >= next_due
+        except Exception:
+            return True
+
+    def mark_backup_event(self, user_id: int, event_type: str) -> None:
+        """Record a vault change for debounced backup-on-change. event_type e.g. 'secret_add'|'secret_delete'."""
+        self._pending_change_at[user_id] = time.time()
+
+    def process_pending_backup_jobs(
+        self,
+        user_id: int,
+        priv_key_data: Optional[bytes] = None,
+    ) -> Tuple[bool, Optional[str]]:
+        """
+        Run scheduled or debounced change-triggered backup if due. Uses cached key.
+        Returns (did_run, message_or_none). Safe to call from UI timer.
+        """
+        if priv_key_data is None:
+            return False, None
+        cfg = self._get_config(user_id)
+        if not cfg or not cfg["backup_enabled"]:
+            return False, None
+        settings = self.get_backup_settings(user_id)
+        did_run = False
+        if settings.get("backup_auto_enabled") and self.should_run_scheduled_backup(user_id):
+            ok, msg = self.create_local_backup_now(user_id, priv_key_data, reason="scheduled")
+            did_run = ok
+            if not ok and "Provide recovery key" not in (msg or ""):
+                self.audit.log_event("local_backup_failed", {"user_id": user_id, "reason": "scheduled", "error": msg}, user_id=user_id)
+            return did_run, msg
+        last_change = self._pending_change_at.get(user_id)
+        if settings.get("backup_on_change_enabled") and last_change is not None:
+            debounce = settings.get("on_change_debounce_seconds", ON_CHANGE_DEBOUNCE_DEFAULT)
+            try:
+                debounce = max(ON_CHANGE_DEBOUNCE_MIN, min(ON_CHANGE_DEBOUNCE_MAX, int(debounce)))
+            except (TypeError, ValueError):
+                debounce = ON_CHANGE_DEBOUNCE_DEFAULT
+            if (time.time() - last_change) >= debounce:
+                self._pending_change_at.pop(user_id, None)
+                ok, msg = self.create_local_backup_now(user_id, priv_key_data, reason="change_triggered")
+                did_run = ok
+                if not ok and "Provide recovery key" not in (msg or ""):
+                    self.audit.log_event("local_backup_failed", {"user_id": user_id, "reason": "change_triggered", "error": msg}, user_id=user_id)
+                return did_run, msg
+        return False, None
+
+    def get_backup_status(self, user_id: int) -> Dict[str, Any]:
+        """Full backup health for dashboard (Phase 5): enabled, mode, last_backup_at, count, next_due, validation, staleness, restore_readiness."""
+        status = self.get_backup_recovery_status(user_id)
+        settings = self.get_backup_settings(user_id)
+        backups = self.list_local_backups(user_id)
+        cfg = self._get_config(user_id)
+        last_backup_at = (cfg or {}).get("last_backup_at")
+        next_due = None
+        if status.get("enabled") and settings.get("backup_auto_enabled") and last_backup_at:
+            try:
+                interval = settings.get("schedule_interval_hours", SCHEDULE_INTERVAL_DEFAULT_HOURS)
+                last_dt = datetime.datetime.fromisoformat(str(last_backup_at).replace("Z", "+00:00"))
+                next_due = (last_dt + datetime.timedelta(hours=interval)).isoformat()
+            except Exception:
+                pass
+        # Staleness: warn if no successful backup in the last N days
+        stale_warning = None
+        last_backup_age_days = None
+        if last_backup_at:
+            try:
+                last_dt = datetime.datetime.fromisoformat(str(last_backup_at).replace("Z", "").strip())
+                if last_dt.tzinfo:
+                    now = datetime.datetime.now(last_dt.tzinfo)
+                else:
+                    now = datetime.datetime.utcnow()
+                delta = now - last_dt
+                last_backup_age_days = delta.total_seconds() / 86400.0
+                threshold = settings.get("stale_warning_days", STALE_WARNING_DAYS_DEFAULT)
+                if last_backup_age_days > threshold:
+                    stale_warning = f"No successful backup in {int(last_backup_age_days)} days"
+            except Exception:
+                pass
+        latest_validation_ok = settings.get("latest_validation_ok")
+        latest_validation_at = settings.get("latest_validation_at")
+        restore_readiness = (
+            "Recovery is possible if you have a valid local backup and your Backup Recovery Key or Backup Password."
+            if status.get("enabled") else "Enable Backup Recovery Key or Backup Password to allow restore from backup."
+        )
+        return {
+            "enabled": status.get("enabled", False),
+            "mode": status.get("mode"),
+            "recovery_configured": status.get("has_verifier", False),
+            "last_backup_at": last_backup_at,
+            "last_backup_age_days": last_backup_age_days,
+            "local_backup_count": len(backups),
+            "next_scheduled_due": next_due,
+            "backup_auto_enabled": settings.get("backup_auto_enabled", False),
+            "backup_on_change_enabled": settings.get("backup_on_change_enabled", False),
+            "on_change_debounce_seconds": settings.get("on_change_debounce_seconds", ON_CHANGE_DEBOUNCE_DEFAULT),
+            "keep_last_n_backups": settings.get("keep_last_n_backups", KEEP_LAST_N_DEFAULT),
+            "schedule_interval_hours": settings.get("schedule_interval_hours", SCHEDULE_INTERVAL_DEFAULT_HOURS),
+            "latest_backup_path": backups[0]["path"] if backups else None,
+            "latest_validation_ok": latest_validation_ok,
+            "latest_validation_at": latest_validation_at,
+            "staleness_warning": stale_warning,
+            "restore_readiness": restore_readiness,
+            "backup_folder_path": self.get_backup_folder_path(user_id),
+            "stale_warning_days": settings.get("stale_warning_days", STALE_WARNING_DAYS_DEFAULT),
+        }
