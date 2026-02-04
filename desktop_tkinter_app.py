@@ -4498,3 +4498,2588 @@ class VaultTkApp:
                     password_final = match.group(1)
                     self.logger.warning("Extracted password from dict string - this should not happen")
                 else:
+                    # Last resort: try ast parsing
+                    try:
+                        import ast
+                        parsed = ast.literal_eval(password_final)
+                        if isinstance(parsed, dict):
+                            password_final = str(parsed.get("password", ""))
+                    except Exception:
+                        password_final = ""
+            
+            # Insert the clean password string
+            p_val.insert(0, password_final)
+            p_val.config(state="readonly")
+            p_val.pack(side="left", fill="x", expand=True)
+            
+            if isinstance(res, dict) and res.get("totp_secret"):
+                rowt = ttk.Frame(w)
+                rowt.pack(fill="x", padx=20, pady=4)
+                ttk.Label(rowt, text="TOTP:", width=10).pack(side="left")
+                t_val = tk.Entry(
+                    rowt, 
+                    relief="solid", 
+                    bd=1,
+                    bg=bg_color,  # FIXED: Use explicit background for better contrast
+                    fg=text_color,  # FIXED: Explicit text color for visibility
+                    font=self.font_mono,
+                    insertbackground=text_color,  # Cursor color matches text
+                    highlightthickness=1,
+                    highlightbackground=self.palette.get("border", "#30363d"),
+                    highlightcolor=self.palette.get("accent", "#58a6ff")
+                )
+                code = self.api.generate_totp_code(res["totp_secret"])
+                t_val.insert(0, str(code))
+                t_val.config(state="readonly")
+                t_val.pack(side="left", fill="x", expand=True)
+
+            ttk.Button(w, text="Close", command=w.destroy).pack(pady=12)
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed to reveal: {e}")
+
+    def copy_selected_password(self):
+        if not self.session:
+            return
+        ids = self._get_selected_entry_ids()
+        if len(ids) > 1:
+            self._show_toast("Select a single entry to copy its password.", "warning")
+            return
+        if not self._require_step_up_or_phrase("copy_password", "copy the saved password"):
+            return
+
+        pw = self._decrypt_selected_password()
+        if pw is None:
+            return
+        self._copy_to_clipboard(pw, "Password")
+
+    def copy_selected_username(self):
+        data = self._get_selected_values()
+        if not data:
+            return messagebox.showwarning("Select", "Select an entry first.")
+        self._copy_to_clipboard(str(data.get("username", "")), "Username")
+
+    def copy_selected_url(self):
+        data = self._get_selected_values()
+        if not data:
+            return messagebox.showwarning("Select", "Select an entry first.")
+        self._copy_to_clipboard(str(data.get("url", "")), "URL")
+
+    def copy_selected_service(self):
+        data = self._get_selected_values()
+        if not data:
+            return messagebox.showwarning("Select", "Select an entry first.")
+        self._copy_to_clipboard(str(data.get("service", "")), "Service")
+
+    def copy_selected_totp(self):
+        code = self.totp_var.get()
+        if not code or code == "-" or code == "N/A":
+            return self._show_toast("No TOTP secret for this entry", "warning")
+        self._copy_to_clipboard(code, "TOTP")
+
+    def delete_selected(self):
+        if not self.session:
+            return
+        ids = self._get_selected_entry_ids()
+        if not ids:
+            return messagebox.showwarning("Delete", "Select at least one entry to delete.")
+        if not self._require_step_up_or_phrase("delete_secret", "delete selected password entries"):
+            return
+
+        if len(ids) > 1:
+            if not messagebox.askyesno("Delete", f"Permanently delete {len(ids)} entries? This cannot be undone."):
+                return
+            if self._undo_buffer:
+                self._commit_undo_action()
+            deleted = 0
+            for entry_id in ids:
+                ok, _ = self.api.delete_secret(self.session["user_id"], entry_id)
+                if ok:
+                    deleted += 1
+            self.refresh_vault_table()
+            self._show_toast(f"{deleted} entries deleted.", "info")
+            return
+
+        data = self._get_selected_values()
+        if not data:
+            return
+        entry_id = data["id"]
+        service = data["service"]
+        if self._undo_buffer:
+            self._commit_undo_action()
+        target_rid = None
+        for rid in self.vault_table.get_children():
+            try:
+                if int(rid) == entry_id:
+                    target_rid = rid
+                    break
+            except (ValueError, TypeError):
+                pass
+        if not target_rid:
+            return
+        self.vault_table.delete(target_rid)
+
+        def _do_actual_delete():
+            if not self.session:
+                self._undo_buffer = None
+                return
+            if self._undo_buffer and self._undo_buffer["entry_id"] == entry_id:
+                ok, _ = self.api.delete_secret(self.session["user_id"], entry_id)
+                if ok:
+                    self.logger.info("Secret deleted permanently: %s", service)
+                else:
+                    self._show_toast(f"Failed to delete {service}", "error")
+                    self.refresh_vault_table()
+                self._undo_buffer = None
+
+        undo_job = self.root.after(self.DEFAULT_UNDO_TIMEOUT_MS, _do_actual_delete)
+        self._undo_buffer = {
+            "action": "delete",
+            "entry_id": entry_id,
+            "service": service,
+            "job_id": undo_job
+        }
+        self._show_toast(f"Deleted {service}. Undo? (Ctrl+Z)", "info", duration_ms=10000)
+        self.root.bind("<Control-z>", self.undo_action)
+
+    def undo_action(self, _event=None):
+        """Reverses the last destructive action if it is still in the buffer."""
+        if not self._undo_buffer:
+            return
+
+        if self._undo_buffer["action"] == "delete":
+            self.root.after_cancel(self._undo_buffer["job_id"])
+            self._undo_buffer = None
+            self.refresh_vault_table()
+            self._show_toast("Deletion undone", "success")
+            self.root.unbind("<Control-z>")
+
+    def _commit_undo_action(self):
+        """Executes the pending action immediately."""
+        if not self._undo_buffer:
+            return
+        self.root.after_cancel(self._undo_buffer["job_id"])
+        if self._undo_buffer["action"] == "delete":
+            self.api.delete_secret(self.session["user_id"], self._undo_buffer["entry_id"])
+        self._undo_buffer = None
+
+    def _update_strength_meter(self):
+        pwd = self.password_var.get()
+        if not pwd:
+            self.strength_canvas.delete("all")
+            self.strength_label.config(text="")
+            return
+
+        score, reasons = self.api.calculate_strength(pwd)
+        color = STRENGTH_COLOURS.get(score, "#e2e8f0")
+        label = STRENGTH_LABELS.get(score, "Unknown")
+
+        if reasons and score < 4:
+            label += f" ({reasons[0]})"
+
+        self.strength_canvas.delete("all")
+        w = self.strength_canvas.winfo_width()
+        if w < 10: w = 240 # fallback
+        fill_w = (w * (score + 1)) / 5
+        self.strength_canvas.create_rectangle(0, 0, fill_w, 6, fill=color, outline="")
+        self.strength_label.config(text=label, foreground=color)
+
+    # ---------------------- import ----------------------
+    def _build_import_page(self):
+        page = ttk.Frame(self.content)
+        ttk.Label(page, text="Bring passwords from another app", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(page, text="Pick a CSV or JSON file (e.g. exported from Chrome or Firefox), then click Import.", style="Sub.TLabel").pack(anchor="w", pady=(0, 4))
+        
+        info_frame = ttk.Frame(page, style="Panel.TFrame", padding=10)
+        info_frame.pack(fill="x", pady=(0, 10))
+        ttk.Label(
+            info_frame,
+            text="💡 This is for a list of passwords from a file. To restore everything from a backup you made here, use the Backup tab.",
+            style="Sub.TLabel",
+            foreground=self.palette.get("accent", "#58a6ff"),
+            justify="left",
+            wraplength=800
+        ).pack(anchor="w")
+
+        self.import_path_var = tk.StringVar()
+
+        row = ttk.Frame(page)
+        row.pack(fill="x")
+        self.import_entry = self._make_entry(row, self.import_path_var)
+        self.import_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        ttk.Button(row, text="Browse", command=self._pick_csv).pack(side="left")
+        ttk.Button(row, text="Preview file", command=self._preview_import_file, style="Secondary.TButton").pack(side="left", padx=4)
+        ttk.Button(row, text="Import now", command=self.import_csv, style="Accent.TButton").pack(side="left", padx=8)
+
+        summary = ttk.Frame(page)
+        summary.pack(fill="x", pady=(10, 8))
+
+        self.imp_total_var = tk.StringVar(value="Total rows: 0")
+        self.imp_imported_var = tk.StringVar(value="Imported: 0")
+        self.imp_skipped_var = tk.StringVar(value="Skipped: 0")
+
+        for i, var in enumerate([self.imp_total_var, self.imp_imported_var, self.imp_skipped_var]):
+            box = ttk.Frame(summary, style="Panel.TFrame", padding=10)
+            box.grid(row=0, column=i, padx=(0 if i == 0 else 8, 0), sticky="nsew")
+            ttk.Label(box, textvariable=var, style="CardTitle.TLabel").pack(anchor="w")
+            summary.columnconfigure(i, weight=1)
+
+        ctrl = ttk.Frame(page)
+        ctrl.pack(fill="x", pady=(0, 6))
+        self.import_toggle_btn = ttk.Button(ctrl, text="👁 Show passwords", command=self._toggle_import_passwords)
+        self.import_toggle_btn.pack(side="left")
+        ttk.Button(ctrl, text="Clear list", command=self._clear_import_view, style="Secondary.TButton").pack(side="left", padx=8)
+
+        table_panel = ttk.Frame(page, style="Panel.TFrame", padding=8)
+        table_panel.pack(fill="both", expand=True)
+
+        cols = ("row", "service", "username", "url", "password")
+        self.import_table = ttk.Treeview(table_panel, columns=cols, show="headings", height=12)
+        headers = {
+            "row": ("Row", 80),
+            "service": ("Service", 240),
+            "username": ("Username", 240),
+            "url": ("URL", 380),
+            "password": ("Password", 220),
+        }
+        for key, (title, width) in headers.items():
+            self.import_table.heading(key, text=title)
+            self.import_table.column(key, width=width, anchor="w")
+
+        y = ttk.Scrollbar(table_panel, orient="vertical", command=self.import_table.yview)
+        x = ttk.Scrollbar(table_panel, orient="horizontal", command=self.import_table.xview)
+        self.import_table.configure(yscrollcommand=y.set, xscrollcommand=x.set)
+
+        self.import_table.grid(row=0, column=0, sticky="nsew")
+        y.grid(row=0, column=1, sticky="ns")
+        x.grid(row=1, column=0, sticky="ew")
+        table_panel.rowconfigure(0, weight=1)
+        table_panel.columnconfigure(0, weight=1)
+
+        err_panel = ttk.Frame(page)
+        err_panel.pack(fill="x", pady=(8, 0))
+        ttk.Label(err_panel, text="Import notes", style="Sub.TLabel").pack(anchor="w")
+        self.import_notes = tk.Text(
+            err_panel,
+            height=5,
+            wrap="word",
+            bg=self.palette.get("input_bg", self.palette["panel"]),
+            fg=self.palette["text"],
+            font=self.font_small,
+            relief="solid",
+            bd=1,
+        )
+        self.import_notes.pack(fill="x")
+        self.import_notes.insert("1.0", "No import yet.")
+        self.import_notes.configure(state="disabled")
+
+        return page
+
+    def _clear_import_view(self):
+        self.import_rows = []
+        self.import_show_passwords = False
+        self.imp_total_var.set("Total rows: 0")
+        self.imp_imported_var.set("Imported: 0")
+        self.imp_skipped_var.set("Skipped: 0")
+        self.import_toggle_btn.configure(text="👁 Show passwords")
+        self._set_import_notes("No import yet.")
+        self._refresh_import_table()
+
+    def _set_import_notes(self, text: str):
+        self.import_notes.configure(state="normal")
+        self.import_notes.delete("1.0", "end")
+        self.import_notes.insert("1.0", text)
+        self.import_notes.configure(state="disabled")
+
+    def _refresh_import_table(self):
+        if not hasattr(self, "import_table"):
+            return
+        for iid in self.import_table.get_children():
+            self.import_table.delete(iid)
+
+        for idx, row in enumerate(self.import_rows, start=1):
+            pw = row.get("password", "")
+            if not self.import_show_passwords:
+                pw_val = "•" * min(max(len(pw), 8), 16) if pw else ""
+            else:
+                pw_val = pw
+            self.import_table.insert(
+                "",
+                "end",
+                iid=f"imp-{idx}",
+                values=(row.get("row", ""), row.get("service", ""), row.get("username", ""), row.get("url", ""), pw_val),
+            )
+
+    def _toggle_import_passwords(self):
+        if not self.import_rows:
+            messagebox.showinfo("Show passwords", "Load a file first: click Preview file or Import now.")
+            return
+        if not self.import_show_passwords:
+            if not self._require_step_up_or_phrase("show_import_passwords", "show imported passwords"):
+                return
+            self.import_show_passwords = True
+            self.import_toggle_btn.configure(text="🙈 Hide passwords")
+        else:
+            self.import_show_passwords = False
+            self.import_toggle_btn.configure(text="👁 Show passwords")
+        self._refresh_import_table()
+
+    def _preview_import_file(self):
+        """Load file for preview without importing. Use Show passwords to reveal."""
+        file_path = self.import_path_var.get().strip()
+        if not file_path:
+            messagebox.showwarning("Preview", "Choose a file first (Browse).")
+            return
+        fp = Path(file_path)
+        if not fp.exists():
+            messagebox.showerror("Preview", f"File not found:\n{file_path}")
+            return
+        try:
+            ext = (fp.suffix or "").lower()
+            if ext == ".json":
+                rows = self._fallback_preview_from_json(file_path, max_rows=10000)
+            else:
+                rows = self._fallback_preview_from_csv(file_path, max_rows=10000)
+            self.import_rows = rows
+            self.import_show_passwords = False
+            self.import_toggle_btn.configure(text="👁 Show passwords")
+            self.imp_total_var.set(f"Total rows: {len(rows)}")
+            self.imp_imported_var.set("Imported: 0")
+            self.imp_skipped_var.set("Skipped: 0")
+            self._refresh_import_table()
+            self._set_import_notes(f"Preview loaded: {len(rows)} entries. Click Show passwords to reveal, or Import now to add to vault.")
+        except Exception as e:
+            messagebox.showerror("Preview failed", str(e))
+            self._set_import_notes(f"Preview failed: {e}")
+
+    def _pick_csv(self):
+        path = filedialog.askopenfilename(
+            title="Select password file (CSV or JSON)",
+            filetypes=[("CSV files", "*.csv"), ("JSON files", "*.json"), ("All files", "*.*")],
+        )
+        if path:
+            self.import_path_var.set(path)
+
+    def _fallback_preview_from_csv(self, csv_path: str, max_rows: int = 10000):
+        out = []
+        try:
+            with open(csv_path, "r", encoding="utf-8-sig", newline="") as f:
+                r = csv.DictReader(f)
+                for i, row in enumerate(r, start=2):
+                    if len(out) >= max_rows:
+                        break
+                    service = (row.get("name") or row.get("service") or row.get("site") or row.get("title") or "Imported Entry").strip()
+                    username = (row.get("username") or row.get("username_email") or row.get("email") or row.get("login") or "unknown").strip()
+                    url = (row.get("url") or row.get("website") or row.get("site_url") or "").strip()
+                    password = (row.get("password") or row.get("secret") or row.get("pass") or "").strip()
+                    if password:
+                        out.append({"row": i, "service": service, "username": username, "url": url, "password": password})
+        except Exception:
+            return []
+        return out
+
+    def _fallback_preview_from_json(self, json_path: str, max_rows: int = 10000):
+        out = []
+        try:
+            with open(json_path, "r", encoding="utf-8-sig") as f:
+                data = json.load(f)
+            
+            # Handle different JSON formats
+            entries = []
+            if isinstance(data, list):
+                entries = data
+            elif isinstance(data, dict):
+                if "logins" in data:
+                    entries = data["logins"]
+                elif "entries" in data:
+                    entries = data["entries"]
+                elif "passwords" in data:
+                    entries = data["passwords"]
+                else:
+                    for key, value in data.items():
+                        if isinstance(value, list) and value:
+                            entries = value
+                            break
+            
+            for i, entry in enumerate(entries, start=1):
+                if len(out) >= max_rows:
+                    break
+                
+                entry_lower = {str(k).lower(): v for k, v in entry.items() if isinstance(k, str)}
+                
+                service = ""
+                username = ""
+                url = ""
+                password = ""
+                
+                for key in ["hostname", "origin", "url", "site", "website", "name", "service", "title"]:
+                    if key in entry_lower and isinstance(entry_lower[key], str):
+                        service = entry_lower[key].strip()
+                        break
+                
+                for key in ["username", "user", "email", "login"]:
+                    if key in entry_lower and isinstance(entry_lower[key], str):
+                        username = entry_lower[key].strip()
+                        break
+                
+                for key in ["url", "website", "site", "origin"]:
+                    if key in entry_lower and isinstance(entry_lower[key], str):
+                        url = entry_lower[key].strip()
+                        break
+                
+                for key in ["password", "pass", "pwd", "secret"]:
+                    if key in entry_lower and isinstance(entry_lower[key], str):
+                        password = entry_lower[key].strip()
+                        break
+                
+                if not service:
+                    service = "Imported Entry"
+                if password:
+                    out.append({"row": i, "service": service, "username": username, "url": url, "password": password})
+        except Exception:
+            return []
+        return out
+
+    def import_csv(self):
+        if not self.session:
+            return messagebox.showwarning("Import", "Login first.")
+
+        # Re-auth gate for import (security best practice)
+        if not self._require_step_up_or_phrase("import_passwords", "import passwords from file"):
+            return
+
+        file_path = self.import_path_var.get().strip()
+        if not file_path:
+            return messagebox.showwarning("Import", "Choose a file first.")
+
+        fp = Path(file_path)
+        if not fp.exists():
+            return messagebox.showerror("Import failed", f"File not found:\n{file_path}")
+
+        try:
+            cert = self.api.get_active_certificate(self.session["user_id"], "encryption")
+            if not cert:
+                return messagebox.showerror("Import failed", "No active encryption certificate available. Please ensure you are logged in properly.")
+            
+            # Detect file type and import accordingly
+            file_ext = fp.suffix.lower()
+            if file_ext == ".json":
+                ok, result = self.api.import_secrets_from_json(self.session["user_id"], file_path, cert, max_rows=10000)
+            elif file_ext == ".csv":
+                ok, result = self.api.import_secrets_from_csv(self.session["user_id"], file_path, cert, max_rows=10000)
+            else:
+                # Try to auto-detect by reading first few bytes
+                with open(file_path, "rb") as f:
+                    first_bytes = f.read(1024)
+                    try:
+                        first_bytes.decode("utf-8").strip().startswith("{")
+                        ok, result = self.api.import_secrets_from_json(self.session["user_id"], file_path, cert, max_rows=10000)
+                    except (UnicodeDecodeError, AttributeError):
+                        ok, result = self.api.import_secrets_from_csv(self.session["user_id"], file_path, cert, max_rows=10000)
+
+            # FIXED: Better error message extraction with detailed logging
+            if not ok:
+                # Check for error message in various possible keys
+                if isinstance(result, dict):
+                    error_msg = (
+                        result.get("error") or 
+                        result.get("message") or 
+                        result.get("error_message") or
+                        "Import failed. Check the CSV file format and try again."
+                    )
+                elif isinstance(result, str):
+                    error_msg = result
+                else:
+                    error_msg = f"Import failed: {str(result)}"
+                
+                self.logger.error("Import failed: %s (result type: %s)", error_msg, type(result).__name__)
+                
+                # Show detailed error message
+                detailed_msg = f"{error_msg}\n\nFile: {fp.name}"
+                messagebox.showerror("Import failed", detailed_msg)
+                self._set_import_notes(f"Import failed: {error_msg}")
+                return
+
+            # Process successful import
+            total = int(result.get("total_rows", 0))
+            imported = int(result.get("imported", result.get("added", 0)))
+            skipped = int(result.get("skipped", 0))
+            failed = int(result.get("failed", 0))
+
+            self.imp_total_var.set(f"Total rows: {total}")
+            self.imp_imported_var.set(f"Imported: {imported}")
+            self.imp_skipped_var.set(f"Skipped: {skipped}")
+
+            self.import_show_passwords = False
+            self.import_toggle_btn.configure(text="👁 Show passwords")
+
+            rows = result.get("imported_items") or []
+            if not rows and imported > 0:
+                # Try to generate preview from file
+                if file_ext == ".csv":
+                    rows = self._fallback_preview_from_csv(file_path, max_rows=min(imported, 10000))
+                elif file_ext == ".json":
+                    rows = self._fallback_preview_from_json(file_path, max_rows=min(imported, 10000))
+
+            self.import_rows = rows
+            self._refresh_import_table()
+
+            errors = result.get("errors") or result.get("messages") or []
+            if errors:
+                preview = "\n".join(f"• {e}" for e in errors[:30])
+                if len(errors) > 30:
+                    preview += f"\n• ... and {len(errors)-30} more"
+                notes = f"Import completed with warnings.\n\n{preview}"
+            else:
+                notes = "Import completed successfully. No warnings."
+            self._set_import_notes(notes)
+
+            self.refresh_vault_table()
+            self.refresh_dashboard(force_health=True)
+
+            if imported > 0:
+                self._run_backup_after_import()
+                messagebox.showinfo("Import", f"Imported {imported} entries.\nSkipped: {skipped}\nFailed: {failed}")
+                self._set_status(f"CSV import complete: {imported} imported, {skipped} skipped")
+            else:
+                messagebox.showwarning("Import", f"No entries imported.\nSkipped: {skipped}\nFailed: {failed}\n\nCheck the file format.")
+                self._set_status(f"Import: {skipped} skipped, {failed} failed")
+                
+        except Exception as e:
+            error_msg = f"Import error: {str(e)}"
+            self.logger.error("Import exception: %s", e, exc_info=True)
+            messagebox.showerror("Import failed", f"{error_msg}\n\nFile: {fp.name}\n\nCheck the file format and try again.")
+            self._set_import_notes(f"Import failed: {error_msg}")
+
+    def _run_backup_after_import(self):
+        """Run a change-triggered backup immediately after import if backup-on-change is enabled."""
+        if not self.session:
+            return
+        try:
+            uid = int(self.session["user_id"])
+            enc_priv = self.session.get("enc_priv")
+            if not enc_priv:
+                return
+            enc_priv_bytes = bytes(enc_priv) if isinstance(enc_priv, bytearray) else enc_priv
+            status = self.api.get_backup_status(uid)
+            if not status.get("enabled") or not status.get("backup_on_change_enabled"):
+                return
+            key_or_pass = None
+            mode = None
+            if hasattr(self, "backup_recovery_key_var"):
+                key_or_pass = (self.backup_recovery_key_var.get() or "").strip()
+            if key_or_pass:
+                ok_resolve, mode, err = self.api.resolve_recovery_factor(uid, key_or_pass)
+                if ok_resolve:
+                    ok, msg = self.api.create_local_backup_now(
+                        uid, enc_priv_bytes, reason="change_triggered",
+                        recovery_key_or_password=key_or_pass, mode=mode
+                    )
+                    if ok:
+                        self.api.set_auto_backup_key_for_session(uid, key_or_pass, mode)
+                else:
+                    ok, msg = False, err
+            else:
+                ok, msg = self.api.create_local_backup_now(uid, enc_priv_bytes, reason="change_triggered")
+            if ok and hasattr(self, "backup_phase2_status_var"):
+                self.refresh_backup_page()
+                self._show_toast("Backup created after import", "success")
+        except Exception:
+            pass
+
+    # ---------------------- backup ----------------------
+    def _build_backup_page(self):
+        # Scrollable container so checkboxes and bottom section are never clipped
+        outer = ttk.Frame(self.content)
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(0, weight=1)
+        canvas = tk.Canvas(
+            outer,
+            bg=self.palette["bg"],
+            highlightthickness=0,
+        )
+        scrollbar = ttk.Scrollbar(outer)
+        inner = ttk.Frame(canvas)
+        inner_window = canvas.create_window(0, 0, window=inner, anchor="nw")
+
+        def _on_frame_configure(event=None):
+            canvas.configure(scrollregion=canvas.bbox("all"))
+
+        def _on_canvas_configure(event):
+            w = event.width
+            canvas.itemconfig(inner_window, width=max(w, inner.winfo_reqwidth()))
+
+        inner.bind("<Configure>", _on_frame_configure)
+        canvas.bind("<Configure>", _on_canvas_configure)
+        canvas.configure(yscrollcommand=scrollbar.set)
+        scrollbar.configure(command=canvas.yview)
+
+        canvas.grid(row=0, column=0, sticky="nsew")
+        scrollbar.grid(row=0, column=1, sticky="ns")
+
+        def _scroll_backup(delta_units: int):
+            canvas.yview_scroll(-delta_units, "units")
+
+        def _on_mousewheel(event):
+            if getattr(event, "delta", None) is not None:
+                _scroll_backup(int(event.delta / 120))
+            return "break"
+
+        def _on_linux_scroll_up(event):
+            _scroll_backup(3)
+            return "break"
+
+        def _on_linux_scroll_down(event):
+            _scroll_backup(-3)
+            return "break"
+
+        def _bind_mousewheel_to_children(parent):
+            parent.bind("<MouseWheel>", _on_mousewheel)
+            try:
+                parent.bind("<Button-4>", _on_linux_scroll_up)
+                parent.bind("<Button-5>", _on_linux_scroll_down)
+            except Exception:
+                pass
+            for child in parent.winfo_children():
+                _bind_mousewheel_to_children(child)
+
+        canvas.bind("<MouseWheel>", _on_mousewheel)
+        canvas.bind("<Button-4>", _on_linux_scroll_up)
+        canvas.bind("<Button-5>", _on_linux_scroll_down)
+
+        page = inner
+        ttk.Label(page, text="Backup & recovery", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(
+            page,
+            text="Save a copy of your passwords on this device. You need a key or password to open it later.",
+            style="Sub.TLabel",
+        ).pack(anchor="w", pady=(0, 10))
+        
+        info_frame = ttk.Frame(page, style="Panel.TFrame", padding=10)
+        info_frame.pack(fill="x", pady=(0, 10))
+        ttk.Label(
+            info_frame,
+            text="💡 To bring in passwords from a browser file (CSV/JSON), use the Import tab. To get back everything from a backup you made here, use the Backup tab.",
+            style="Sub.TLabel",
+            foreground=self.palette.get("accent", "#58a6ff"),
+            justify="left",
+            wraplength=800
+        ).pack(anchor="w")
+        ttk.Label(
+            info_frame,
+            text="Forgot both login and recovery passwords? On the login screen click \"Forgot both? Restore from a backup file\" and use your backup key or backup password.",
+            style="Sub.TLabel",
+            foreground=self.palette.get("accent", "#58a6ff"),
+            justify="left",
+            wraplength=800,
+        ).pack(anchor="w", pady=(4, 0))
+
+        # ── 1) Recovery Setup (Phase 5: clear sections) ──
+        recovery_frame = ttk.Frame(page, style="Panel.TFrame", padding=12)
+        recovery_frame.pack(fill="x", pady=(0, 12))
+        ttk.Label(recovery_frame, text="Step 1: Choose how to protect your backup", style="Header.TLabel").pack(anchor="w")
+        self.backup_recovery_status_var = tk.StringVar(value="Checking…")
+        self.backup_recovery_status_label = ttk.Label(recovery_frame, textvariable=self.backup_recovery_status_var, style="Sub.TLabel")
+        self.backup_recovery_status_label.pack(anchor="w", pady=(4, 8))
+        btn_row = ttk.Frame(recovery_frame)
+        btn_row.pack(fill="x")
+        ttk.Button(btn_row, text="Get a recovery key (long code – save it once)", style="Accent.TButton", command=self._on_enable_backup_recovery_key).pack(side="left", padx=(0, 8))
+        ttk.Button(btn_row, text="Use a password I choose instead", style="Secondary.TButton", command=self._on_set_backup_password).pack(side="left", padx=(0, 8))
+        ttk.Button(btn_row, text="Save backup to a file (on my PC)", style="Secondary.TButton", command=self._on_create_recovery_backup).pack(side="left")
+        ttk.Label(recovery_frame, text="Type your backup key or backup password here (same one you set above):", style="Sub.TLabel").pack(anchor="w", pady=(8, 2))
+        self.backup_recovery_key_var = tk.StringVar()
+        row1 = self._make_password_entry_with_eye(
+            recovery_frame,
+            self.backup_recovery_key_var,
+            mask="•",
+            require_step_up_for_reveal=True,
+            step_up_action_name="reveal_backup_key",
+            step_up_action_text="reveal backup key or password",
+        )
+        row1.pack(fill="x")
+        self.backup_recovery_key_entry = row1.winfo_children()[0]
+        save_row = ttk.Frame(recovery_frame)
+        save_row.pack(anchor="w", pady=(6, 0))
+        ttk.Button(save_row, text="Save credentials for this session", style="Secondary.TButton", command=self._on_save_backup_credentials).pack(side="left", padx=(0, 8))
+        ttk.Label(save_row, text="(enables auto backup until logout)", style="Sub.TLabel").pack(side="left")
+        ttk.Label(recovery_frame, text="If you use a recovery key: save it somewhere safe. The app shows it only once.", style="Sub.TLabel", wraplength=700).pack(anchor="w", pady=(8, 0))
+
+        # ── 2) Local Backups (Phase 5) — grid layout for alignment and resize ──
+        phase2_frame = ttk.Frame(page, style="Panel.TFrame", padding=12)
+        phase2_frame.pack(fill="x", pady=(0, 12))
+        phase2_frame.columnconfigure(1, weight=1)
+
+        row = 0
+        ttk.Label(phase2_frame, text="Step 2: Make and check backups", style="Header.TLabel").grid(row=row, column=0, columnspan=3, sticky="w", pady=(0, 4))
+        row += 1
+        self.backup_phase2_status_var = tk.StringVar(value="")
+        ttk.Label(phase2_frame, textvariable=self.backup_phase2_status_var, style="Sub.TLabel", wraplength=700).grid(row=row, column=0, columnspan=3, sticky="w", pady=(0, 6))
+        row += 1
+        ttk.Label(phase2_frame, text="Your backup key or password (same as above):", style="Sub.TLabel").grid(row=row, column=0, columnspan=3, sticky="w", pady=(6, 2))
+        row += 1
+        row_p2 = self._make_password_entry_with_eye(
+            phase2_frame,
+            self.backup_recovery_key_var,
+            mask="•",
+            require_step_up_for_reveal=True,
+            step_up_action_name="reveal_backup_key",
+            step_up_action_text="reveal backup key or password",
+        )
+        row_p2.grid(row=row, column=0, columnspan=3, sticky="ew", pady=(0, 8))
+        self.backup_recovery_key_entry_p2 = row_p2.winfo_children()[0]
+        phase2_frame.rowconfigure(row, weight=0)
+        row += 1
+        p2_btn_frame = ttk.Frame(phase2_frame)
+        p2_btn_frame.grid(row=row, column=0, columnspan=3, sticky="w")
+        ttk.Button(p2_btn_frame, text="Create backup now", style="Accent.TButton", command=self._on_create_backup_now).pack(side="left", padx=(0, 8))
+        ttk.Button(p2_btn_frame, text="Check selected backup", style="Secondary.TButton", command=self._on_validate_selected_backup).pack(side="left", padx=(0, 8))
+        ttk.Button(p2_btn_frame, text="Check latest backup", style="Secondary.TButton", command=self._on_validate_latest_backup).pack(side="left")
+        row += 1
+        ttk.Label(phase2_frame, text="Your backup files:", style="Sub.TLabel").grid(row=row, column=0, columnspan=3, sticky="w", pady=(8, 2))
+        row += 1
+        self.backup_listbox = tk.Listbox(
+            phase2_frame, height=4, selectmode="single",
+            bg=self.palette.get("input_bg", self.palette["panel"]),
+            fg=self.palette["text"],
+            font=self.font_small,
+            highlightthickness=1,
+            highlightbackground=self.palette["border"],
+        )
+        self.backup_listbox.grid(row=row, column=0, columnspan=3, sticky="ew", pady=(0, 8))
+        row += 1
+        ttk.Label(phase2_frame, text="How many backups to keep:", style="Sub.TLabel").grid(row=row, column=0, sticky="w", padx=(0, 8), pady=(0, 4))
+        self.backup_keep_n_var = tk.StringVar(value="10")
+        self.backup_keep_n_spin = self._make_spinbox(phase2_frame, self.backup_keep_n_var, 1, 100, width=8)
+        self.backup_keep_n_spin.grid(row=row, column=1, sticky="w", padx=(0, 8), pady=(0, 4))
+        ttk.Button(phase2_frame, text="Save", command=self._on_save_backup_retention).grid(row=row, column=2, sticky="w", pady=(0, 4))
+        row += 1
+        ttk.Label(phase2_frame, text="Auto backup every (hours):", style="Sub.TLabel").grid(row=row, column=0, sticky="w", padx=(0, 8), pady=(0, 4))
+        self.backup_schedule_hours_var = tk.StringVar(value="24")
+        self.backup_schedule_spin = self._make_spinbox(phase2_frame, self.backup_schedule_hours_var, 1, 168, width=8)
+        self.backup_schedule_spin.grid(row=row, column=1, sticky="w", padx=(0, 8), pady=(0, 4))
+        ttk.Button(phase2_frame, text="Save schedule", command=self._on_save_backup_schedule).grid(row=row, column=2, sticky="w", pady=(0, 4))
+        row += 1
+        ttk.Label(phase2_frame, text="Warn me if no backup for (days):", style="Sub.TLabel").grid(row=row, column=0, sticky="w", padx=(0, 8), pady=(0, 4))
+        self.backup_stale_days_var = tk.StringVar(value="7")
+        self.backup_stale_spin = self._make_spinbox(phase2_frame, self.backup_stale_days_var, 1, 90, width=8)
+        self.backup_stale_spin.grid(row=row, column=1, sticky="w", padx=(0, 8), pady=(0, 4))
+        ttk.Button(phase2_frame, text="Save", command=self._on_save_stale_warning_days).grid(row=row, column=2, sticky="w", pady=(0, 4))
+        row += 1
+        ttk.Label(phase2_frame, text="To use automatic backups, enter your backup key or password in the field above once. The app will use it until you log out.", style="Sub.TLabel", wraplength=700).grid(row=row, column=0, columnspan=3, sticky="w", pady=(8, 4))
+        row += 1
+        self.backup_auto_var = tk.BooleanVar(value=False)
+        self.backup_on_change_var = tk.BooleanVar(value=False)
+        self._make_checkbutton(phase2_frame, "Make a backup automatically on a schedule", self.backup_auto_var, background=self.palette["panel"], command=self._on_backup_auto_toggle).grid(row=row, column=0, columnspan=3, sticky="w", pady=(8, 4))
+        row += 1
+        self._make_checkbutton(phase2_frame, "Make a backup when I add or change passwords", self.backup_on_change_var, background=self.palette["panel"], command=self._on_backup_on_change_toggle).grid(row=row, column=0, columnspan=3, sticky="w", pady=(4, 4))
+        row += 1
+        ttk.Label(phase2_frame, text="Backup on change delay (seconds, 0=immediate):", style="Sub.TLabel").grid(row=row, column=0, sticky="w", padx=(0, 8), pady=(0, 4))
+        self.backup_on_change_debounce_var = tk.StringVar(value="60")
+        self.backup_on_change_debounce_spin = self._make_spinbox(phase2_frame, self.backup_on_change_debounce_var, 0, 300, width=8)
+        self.backup_on_change_debounce_spin.grid(row=row, column=1, sticky="w", padx=(0, 8), pady=(0, 4))
+        ttk.Button(phase2_frame, text="Save", command=self._on_save_backup_on_change_debounce).grid(row=row, column=2, sticky="w", pady=(0, 4))
+        row += 1
+        ttk.Button(phase2_frame, text="Open folder where backups are saved", style="Secondary.TButton", command=self._on_open_backup_folder).grid(row=row, column=0, sticky="w", padx=(0, 8), pady=(0, 4))
+        self.backup_folder_path_var = tk.StringVar(value="")
+        self.backup_folder_path_entry = self._make_entry(phase2_frame, self.backup_folder_path_var)
+        self.backup_folder_path_entry.grid(row=row, column=1, sticky="ew", padx=(0, 8), pady=(0, 4))
+        ttk.Button(phase2_frame, text="Copy path", command=self._on_copy_backup_folder_path).grid(row=row, column=2, sticky="w", pady=(0, 4))
+        row += 1
+        ttk.Label(phase2_frame, text="Backups stay on your computer. You need your key or password to open them.", style="Sub.TLabel", wraplength=700).grid(row=row, column=0, columnspan=3, sticky="w", pady=(4, 0))
+
+        # ── 3) Restore & Reset (Phase 5) ──
+        restore_frame = ttk.Frame(page, style="Panel.TFrame", padding=12)
+        restore_frame.pack(fill="x", pady=(0, 12))
+        ttk.Label(restore_frame, text="Forgot everything?", style="Header.TLabel").pack(anchor="w")
+        ttk.Label(restore_frame, text="On the login screen click \"Forgot both? Restore from a backup file\" and follow the steps.", style="Sub.TLabel", wraplength=700).pack(anchor="w", pady=(4, 0))
+
+        # ── 4) Health (Phase 5 dashboard) ──
+        health_frame = ttk.Frame(page, style="Panel.TFrame", padding=12)
+        health_frame.pack(fill="x", pady=(0, 12))
+        ttk.Label(health_frame, text="Backup status", style="Header.TLabel").pack(anchor="w")
+        self.backup_health_summary_var = tk.StringVar(value="")
+        self.backup_health_label = ttk.Label(health_frame, textvariable=self.backup_health_summary_var, style="Sub.TLabel", wraplength=750, justify="left")
+        self.backup_health_label.pack(anchor="w", pady=(4, 0))
+
+        content = ttk.Frame(page, style="Panel.TFrame", padding=12)
+        content.pack(fill="both", expand=True)
+
+        ttk.Label(content, text="Restore your passwords from a backup", style="Header.TLabel").pack(anchor="w")
+        ttk.Label(content, text="1. Choose your backup file (.json or .enc)", style="Sub.TLabel").pack(anchor="w", pady=(8, 4))
+
+        path_row = ttk.Frame(content)
+        path_row.pack(fill="x")
+        self.backup_import_path_var = tk.StringVar()
+        self.backup_import_path_entry = self._make_entry(path_row, self.backup_import_path_var)
+        self.backup_import_path_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        ttk.Button(path_row, text="Browse", command=self._pick_backup_file).pack(side="left")
+
+        ttk.Label(
+            content,
+            text="2. Type the password or key you used when you made the backup",
+            style="Sub.TLabel",
+        ).pack(anchor="w", pady=(10, 4))
+        self.backup_import_pass_var = tk.StringVar()
+        self.backup_import_pass_entry = self._make_entry(content, self.backup_import_pass_var, show="•")
+        self.backup_import_pass_entry.pack(fill="x")
+        self.backup_import_show = tk.BooleanVar(value=False)
+        self._make_checkbutton(
+            content,
+            "Show passphrase",
+            self.backup_import_show,
+            background=self.palette["panel"],
+            command=lambda: self.backup_import_pass_entry.configure(show="" if self.backup_import_show.get() else "•"),
+        ).pack(anchor="w", pady=(6, 8))
+        ttk.Button(content, text="Restore from this backup", style="Secondary.TButton", command=self._import_backup_file).pack(anchor="w")
+
+        ttk.Separator(content, orient="horizontal").pack(fill="x", pady=12)
+        ttk.Label(content, text="What happened lately (backup log)", style="Header.TLabel").pack(anchor="w")
+        self.backup_events_box = tk.Text(
+            content,
+            height=10,
+            wrap="word",
+            bg=self.palette.get("input_bg", self.palette["panel"]),
+            fg=self.palette["text"],
+            font=self.font_small,
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground=self.palette["border"],
+        )
+        self.backup_events_box.pack(fill="both", expand=True)
+        self.backup_events_box.configure(state="disabled")
+
+        # So mouse wheel scrolls when hovering anywhere over backup content, not just the scrollbar
+        _bind_mousewheel_to_children(inner)
+
+        return outer
+
+    def _pick_backup_file(self):
+        path = filedialog.askopenfilename(
+            title="Select backup file",
+            filetypes=[
+                ("Backup files (.json or .enc)", "*.json;*.enc"),
+                ("JSON files", "*.json"),
+                ("Encrypted backup", "*.enc"),
+                ("All files", "*.*"),
+            ],
+        )
+        if path:
+            self.backup_import_path_var.set(path)
+
+    def _on_enable_backup_recovery_key(self):
+        if not self.session:
+            messagebox.showwarning("Backup", "Login first.")
+            return
+        if not self._require_step_up_or_phrase("reveal_backup_recovery_key", "enable backup recovery key"):
+            return
+        try:
+            ok, msg, one_time_key = self.api.initialize_backup_recovery_for_user(int(self.session["user_id"]))
+            if not ok:
+                messagebox.showerror("Backup Recovery", msg)
+                return
+            warning = "Store this key offline in a safe place. It will NOT be shown again.\n\nYou need this key to restore from an encrypted backup if you forget your main passphrase and recovery phrase."
+            # Show key in a dialog with selectable/copyable field and Copy button (messagebox text is not copyable)
+            dialog = tk.Toplevel(self.root)
+            dialog.title("Backup Recovery Key — save it now")
+            dialog.transient(self.root)
+            dialog.grab_set()
+            dialog.configure(bg=self.palette["bg"])
+            f = ttk.Frame(dialog, style="Panel.TFrame", padding=16)
+            f.pack(fill="both", expand=True)
+            ttk.Label(f, text=msg, style="Sub.TLabel", wraplength=450).pack(anchor="w", pady=(0, 8))
+            ttk.Label(f, text=warning, style="Sub.TLabel", wraplength=450).pack(anchor="w", pady=(0, 12))
+            ttk.Label(f, text="Recovery key (select and Ctrl+C, or use Copy):", style="Sub.TLabel").pack(anchor="w", pady=(0, 4))
+            key_entry = tk.Entry(
+                f,
+                font=self.font_entry,
+                bg=self.palette.get("input_bg", self.palette["panel"]),
+                fg=self.palette.get("input_fg", self.palette["text"]),
+                relief="solid",
+                bd=1,
+                highlightthickness=1,
+                highlightbackground=self.palette["border"],
+            )
+            key_entry.pack(fill="x", pady=(0, 8))
+            key_entry.insert(0, one_time_key)
+            key_entry.select_range(0, tk.END)
+            key_entry.focus_set()
+            def _prevent_edit(evt):
+                # Allow Ctrl+C, Ctrl+A, navigation; block typing that would change the key
+                if (evt.state & 0x4) or evt.keysym in ("Left", "Right", "Up", "Down", "Home", "End", "Tab", "Return"):
+                    return
+                return "break"
+            key_entry.bind("<KeyPress>", _prevent_edit)
+            btn_row = ttk.Frame(f)
+            btn_row.pack(fill="x", pady=(8, 0))
+            def _copy_key():
+                self.root.clipboard_clear()
+                self.root.clipboard_append(one_time_key)
+                self._set_status("Recovery key copied to clipboard")
+            ttk.Button(btn_row, text="Copy to clipboard", style="Accent.TButton", command=_copy_key).pack(side="left", padx=(0, 8))
+            ttk.Button(btn_row, text="OK", style="Secondary.TButton", command=dialog.destroy).pack(side="left")
+            dialog.update_idletasks()
+            dialog.geometry(f"+{self.root.winfo_rootx() + 80}+{self.root.winfo_rooty() + 80}")
+            dialog.resizable(True, False)
+            self.refresh_backup_page()
+            self._set_status("Backup recovery key enabled")
+        except Exception as e:
+            self.logger.error("Enable backup recovery: %s", e, exc_info=True)
+            messagebox.showerror("Backup Recovery", str(e))
+
+    def _on_set_backup_password(self):
+        """Set a memorable backup password (alternative to recovery key) for creating/restoring backups."""
+        if not self.session:
+            messagebox.showwarning("Backup", "Login first.")
+            return
+        if not self._require_step_up_or_phrase("set_backup_password", "set backup password"):
+            return
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Set Backup Password")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        dialog.configure(bg=self.palette["bg"])
+        f = ttk.Frame(dialog, style="Panel.TFrame", padding=16)
+        f.pack(fill="both", expand=True)
+        ttk.Label(f, text="Choose a backup password (min 12 characters). Use it only for backup and restore.", style="Sub.TLabel", wraplength=400).pack(anchor="w", pady=(0, 8))
+        ttk.Label(f, text="Backup password:", style="Sub.TLabel").pack(anchor="w", pady=(0, 2))
+        pass_var = tk.StringVar()
+        self._make_password_entry_with_eye(f, pass_var, mask="•").pack(fill="x", pady=(0, 6))
+        ttk.Label(f, text="Confirm backup password:", style="Sub.TLabel").pack(anchor="w", pady=(4, 2))
+        confirm_var = tk.StringVar()
+        self._make_password_entry_with_eye(f, confirm_var, mask="•").pack(fill="x", pady=(0, 12))
+        err_var = tk.StringVar()
+
+        def do_set():
+            p = pass_var.get() or ""
+            c = confirm_var.get() or ""
+            if len(p) < 12:
+                err_var.set("Password must be at least 12 characters.")
+                return
+            if p != c:
+                err_var.set("Passwords do not match.")
+                return
+            ok, msg = self.api.set_backup_password(int(self.session["user_id"]), p)
+            if not ok:
+                err_var.set(msg)
+                return
+            dialog.destroy()
+            self.refresh_backup_page()
+            self._set_status("Backup password set")
+            messagebox.showinfo("Backup", "Backup password set. Use this password in the field below when creating or restoring backups.")
+
+        ttk.Label(f, textvariable=err_var, style="Sub.TLabel", foreground="red").pack(anchor="w", pady=(0, 4))
+        btn_row = ttk.Frame(f)
+        btn_row.pack(fill="x", pady=(8, 0))
+        ttk.Button(btn_row, text="Set Backup Password", style="Accent.TButton", command=do_set).pack(side="left", padx=(0, 8))
+        ttk.Button(btn_row, text="Cancel", style="Secondary.TButton", command=dialog.destroy).pack(side="left")
+        dialog.geometry("+%d+%d" % (self.root.winfo_rootx() + 100, self.root.winfo_rooty() + 100))
+
+    def _on_create_backup_now(self):
+        """Create versioned local backup now (Phase 2) using recovery key or backup password from field."""
+        if not self.session:
+            messagebox.showwarning("Backup", "Login first.")
+            return
+        if not self._require_step_up_or_phrase("create_backup", "create backup"):
+            return
+        status = self.api.get_backup_recovery_status(int(self.session["user_id"]))
+        if not status.get("enabled"):
+            messagebox.showwarning("Backup", "First choose how to protect your backup: click \"Get a recovery key\" or \"Use a password I choose instead\" above.")
+            return
+        key_or_pass = (self.backup_recovery_key_var.get() or "").strip()
+        ok_resolve, mode, err = self.api.resolve_recovery_factor(int(self.session["user_id"]), key_or_pass)
+        if not ok_resolve:
+            messagebox.showerror("Backup", err)
+            return
+        enc_priv = self.session.get("enc_priv")
+        if not enc_priv:
+            messagebox.showerror("Backup", "Session key not available. Re-login.")
+            return
+        enc_priv_bytes = bytes(enc_priv) if isinstance(enc_priv, bytearray) else enc_priv
+        try:
+            ok, msg = self.api.create_local_backup_now(
+                int(self.session["user_id"]), enc_priv_bytes, reason="manual",
+                recovery_key_or_password=key_or_pass, mode=mode,
+            )
+            if not ok:
+                try:
+                    uid = int(self.session["user_id"]) if self.session else None
+                    self.security_alert_service.notify_security_alert(
+                        "local_backup_failed", {"reason": msg}, user_id=uid
+                    )
+                except Exception:
+                    pass
+                messagebox.showerror("Backup", msg)
+                return
+            self._set_status("Backup created")
+            try:
+                self.refresh_backup_page()
+            except Exception as re:
+                self.logger.debug("Refresh backup page after create: %s", re)
+            messagebox.showinfo("Backup", f"Backup created.\n{msg}")
+        except Exception as e:
+            self.logger.error("Create backup now: %s", e, exc_info=True)
+            messagebox.showerror("Backup", str(e))
+
+    def _on_validate_selected_backup(self):
+        if not self.session:
+            messagebox.showwarning("Backup", "Login first.")
+            return
+        sel = self.backup_listbox.curselection()
+        path = None
+        if sel:
+            idx = int(sel[0])
+            backups = self.api.list_local_backups(int(self.session["user_id"]))
+            if 0 <= idx < len(backups):
+                path = backups[idx].get("path")
+        if not path:
+            backups = self.api.list_local_backups(int(self.session["user_id"]))
+            if backups:
+                path = backups[0].get("path")
+        if not path:
+            messagebox.showwarning("Backup", "No backup selected or no local backups.")
+            return
+        key_or_pass = (self.backup_recovery_key_var.get() or "").strip()
+        ok_resolve, mode, err = self.api.resolve_recovery_factor(int(self.session["user_id"]), key_or_pass)
+        if not ok_resolve:
+            messagebox.showerror("Backup", err)
+            return
+        try:
+            ok, msg = self.api.validate_backup_package(
+                path, key_or_pass, mode, user_id=int(self.session["user_id"])
+            )
+            if ok:
+                messagebox.showinfo("Backup", msg)
+            else:
+                try:
+                    uid = int(self.session["user_id"]) if self.session else None
+                    self.security_alert_service.notify_security_alert(
+                        "backup_validation_failed", {"reason": msg}, user_id=uid
+                    )
+                except Exception:
+                    pass
+                messagebox.showerror("Backup", msg)
+        except Exception as e:
+            self.logger.error("Validate selected backup: %s", e, exc_info=True)
+            messagebox.showerror("Backup", "Validation failed: " + str(e))
+        finally:
+            try:
+                self.refresh_backup_page()
+            except Exception:
+                pass
+
+    def _on_save_backup_retention(self):
+        if not self.session:
+            return
+        try:
+            n = int(self.backup_keep_n_var.get())
+            if n < 1 or n > 100:
+                messagebox.showwarning("Backup", "Keep last N must be between 1 and 100.")
+                return
+        except ValueError:
+            messagebox.showwarning("Backup", "Enter a number between 1 and 100.")
+            return
+        ok, msg = self.api.update_backup_settings(int(self.session["user_id"]), keep_last_n_backups=n)
+        if ok:
+            self._set_status("Retention saved")
+            self.refresh_backup_page()
+        else:
+            messagebox.showerror("Backup", msg)
+
+    def _on_save_backup_schedule(self):
+        if not self.session:
+            return
+        try:
+            h = float(self.backup_schedule_hours_var.get())
+            if h < 0.25 or h > 168:
+                messagebox.showwarning("Backup", "Schedule interval must be between 0.25 and 168 hours.")
+                return
+        except ValueError:
+            messagebox.showwarning("Backup", "Enter a valid number for hours.")
+            return
+        ok, msg = self.api.update_backup_settings(int(self.session["user_id"]), schedule_interval_hours=h)
+        if ok:
+            self._set_status("Schedule saved")
+            self.refresh_backup_page()
+        else:
+            messagebox.showerror("Backup", msg)
+
+    def _on_save_backup_on_change_debounce(self):
+        if not self.session:
+            return
+        try:
+            d = int(self.backup_on_change_debounce_var.get())
+            if d < 0 or d > 300:
+                messagebox.showwarning("Backup", "Delay must be between 0 and 300 seconds (0=immediate).")
+                return
+        except ValueError:
+            messagebox.showwarning("Backup", "Enter a number between 0 and 300.")
+            return
+        ok, msg = self.api.update_backup_settings(int(self.session["user_id"]), on_change_debounce_seconds=d)
+        if ok:
+            self._set_status("Backup on change delay saved")
+            self.refresh_backup_page()
+        else:
+            messagebox.showerror("Backup", msg)
+
+    def _on_save_stale_warning_days(self):
+        if not self.session:
+            return
+        try:
+            d = int(self.backup_stale_days_var.get())
+            if d < 1 or d > 90:
+                messagebox.showwarning("Backup", "Stale warning days must be between 1 and 90.")
+                return
+        except ValueError:
+            messagebox.showwarning("Backup", "Enter a number between 1 and 90.")
+            return
+        ok, msg = self.api.update_backup_settings(int(self.session["user_id"]), stale_warning_days=d)
+        if ok:
+            self._set_status("Stale warning setting saved")
+            self.refresh_backup_page()
+        else:
+            messagebox.showerror("Backup", msg)
+
+    def _on_validate_latest_backup(self):
+        if not self.session:
+            messagebox.showwarning("Backup", "Login first.")
+            return
+        backups = self.api.list_local_backups(int(self.session["user_id"]))
+        if not backups:
+            messagebox.showwarning("Backup", "No local backups to validate.")
+            return
+        path = backups[0].get("path")
+        if not path:
+            messagebox.showwarning("Backup", "No backup file path.")
+            return
+        key_or_pass = (self.backup_recovery_key_var.get() or "").strip()
+        ok_resolve, mode, err = self.api.resolve_recovery_factor(int(self.session["user_id"]), key_or_pass)
+        if not ok_resolve:
+            messagebox.showerror("Backup", err)
+            return
+        try:
+            ok, msg = self.api.validate_backup_package(
+                path, key_or_pass, mode, user_id=int(self.session["user_id"])
+            )
+            if ok:
+                messagebox.showinfo("Backup", msg)
+            else:
+                try:
+                    uid = int(self.session["user_id"]) if self.session else None
+                    self.security_alert_service.notify_security_alert(
+                        "backup_validation_failed", {"reason": msg}, user_id=uid
+                    )
+                except Exception:
+                    pass
+                messagebox.showerror("Backup", msg)
+        except Exception as e:
+            self.logger.error("Validate latest backup: %s", e, exc_info=True)
+            messagebox.showerror("Backup", "Validation failed: " + str(e))
+        finally:
+            try:
+                self.refresh_backup_page()
+            except Exception:
+                pass
+
+    def _on_open_backup_folder(self):
+        if not self.session:
+            messagebox.showwarning("Backup", "Login first.")
+            return
+        path = self.api.get_backup_folder_path(int(self.session["user_id"]))
+        if not path:
+            messagebox.showwarning("Backup", "Backup folder not found.")
+            return
+        folder = Path(path)
+        if not folder.is_dir():
+            messagebox.showwarning("Backup", "Backup folder not found.")
+            return
+        ok, err = platform_open_folder(folder)
+        if not ok and err:
+            messagebox.showerror("Backup", err)
+
+    def _on_copy_backup_folder_path(self):
+        if not self.session:
+            return
+        path = self.api.get_backup_folder_path(int(self.session["user_id"]))
+        if path:
+            self.root.clipboard_clear()
+            self.root.clipboard_append(path)
+            self._set_status("Backup folder path copied")
+
+    def _on_backup_auto_toggle(self):
+        if not self.session:
+            return
+        enabled = self.backup_auto_var.get()
+        if not enabled:
+            ok, msg = self.api.update_backup_settings(int(self.session["user_id"]), backup_auto_enabled=False)
+            if not ok:
+                messagebox.showerror("Backup", msg)
+                self.backup_auto_var.set(True)
+            return
+        # Enabling: require key to be entered and cached first
+        key_or_pass = (self.backup_recovery_key_var.get() or "").strip()
+        ok_resolve, mode, err = self.api.resolve_recovery_factor(int(self.session["user_id"]), key_or_pass)
+        if not ok_resolve:
+            self.backup_auto_var.set(False)
+            self.api.update_backup_settings(int(self.session["user_id"]), backup_auto_enabled=False)
+            messagebox.showwarning("Backup", "Enter your backup key or password in the field above first, then turn on automatic backups again.")
+            return
+        ok2, msg2 = self.api.set_auto_backup_key_for_session(int(self.session["user_id"]), key_or_pass, mode)
+        if not ok2:
+            self.backup_auto_var.set(False)
+            self.api.update_backup_settings(int(self.session["user_id"]), backup_auto_enabled=False)
+            messagebox.showwarning("Backup", msg2)
+            return
+        ok, msg = self.api.update_backup_settings(int(self.session["user_id"]), backup_auto_enabled=True)
+        if not ok:
+            messagebox.showerror("Backup", msg)
+            self.backup_auto_var.set(False)
+        else:
+            self.refresh_backup_page()
+
+    def _on_save_backup_credentials(self):
+        """Save backup key/password to session cache so auto backup can run until logout."""
+        if not self.session:
+            return
+        key_or_pass = (self.backup_recovery_key_var.get() or "").strip()
+        if not key_or_pass:
+            messagebox.showwarning("Backup", "Enter your backup key or password in the field above first.")
+            return
+        ok_resolve, mode, err = self.api.resolve_recovery_factor(int(self.session["user_id"]), key_or_pass)
+        if not ok_resolve:
+            messagebox.showwarning("Backup", err or "Invalid backup key or password.")
+            return
+        ok, msg = self.api.set_auto_backup_key_for_session(int(self.session["user_id"]), key_or_pass, mode)
+        if not ok:
+            messagebox.showwarning("Backup", msg)
+            return
+        self._show_toast("Credentials saved for auto backup", "success")
+        self.refresh_backup_page()
+
+    def _on_backup_on_change_toggle(self):
+        if not self.session:
+            return
+        enabled = self.backup_on_change_var.get()
+        if not enabled:
+            ok, msg = self.api.update_backup_settings(int(self.session["user_id"]), backup_on_change_enabled=False)
+            if not ok:
+                messagebox.showerror("Backup", msg)
+                self.backup_on_change_var.set(True)
+            return
+        # Enabling: require key to be entered and cached first
+        key_or_pass = (self.backup_recovery_key_var.get() or "").strip()
+        ok_resolve, mode, err = self.api.resolve_recovery_factor(int(self.session["user_id"]), key_or_pass)
+        if not ok_resolve:
+            self.backup_on_change_var.set(False)
+            self.api.update_backup_settings(int(self.session["user_id"]), backup_on_change_enabled=False)
+            messagebox.showwarning("Backup", "Enter your backup key or password in the field above first, then turn on automatic backups again.")
+            return
+        ok2, msg2 = self.api.set_auto_backup_key_for_session(int(self.session["user_id"]), key_or_pass, mode)
+        if not ok2:
+            self.backup_on_change_var.set(False)
+            self.api.update_backup_settings(int(self.session["user_id"]), backup_on_change_enabled=False)
+            messagebox.showwarning("Backup", msg2)
+            return
+        ok, msg = self.api.update_backup_settings(int(self.session["user_id"]), backup_on_change_enabled=True)
+        if not ok:
+            messagebox.showerror("Backup", msg)
+            self.backup_on_change_var.set(False)
+        else:
+            self.refresh_backup_page()
+
+    def _on_create_recovery_backup(self):
+        if not self.session:
+            messagebox.showwarning("Backup", "Login first.")
+            return
+        if not self._require_step_up_or_phrase("export_backup", "create encrypted backup"):
+            return
+        status = self.api.get_backup_recovery_status(int(self.session["user_id"]))
+        if not status.get("enabled"):
+            messagebox.showwarning("Backup", "First choose how to protect your backup: click \"Get a recovery key\" or \"Use a password I choose instead\" above.")
+            return
+        key_or_pass = (self.backup_recovery_key_var.get() or "").strip()
+        ok_resolve, mode, err = self.api.resolve_recovery_factor(int(self.session["user_id"]), key_or_pass)
+        if not ok_resolve:
+            messagebox.showerror("Backup export failed", err)
+            return
+        out_path = filedialog.asksaveasfilename(
+            title="Save encrypted backup",
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+            initialfile=f"securevault_recovery_backup_{int(time.time())}.json",
+        )
+        if not out_path:
+            return
+        enc_priv = self.session.get("enc_priv")
+        if not enc_priv:
+            messagebox.showerror("Backup", "Session key not available. Re-login and try again.")
+            return
+        enc_priv_bytes = bytes(enc_priv) if isinstance(enc_priv, bytearray) else enc_priv
+        try:
+            ok, msg, _ = self.api.export_user_backup_encrypted(
+                int(self.session["user_id"]), enc_priv_bytes, out_path, key_or_pass, mode
+            )
+            if not ok:
+                messagebox.showerror("Backup export failed", msg)
+                return
+            uid = int(self.session["user_id"])
+            settings = self.api.get_backup_settings(uid)
+            if settings.get("backup_on_change_enabled"):
+                self.api.set_auto_backup_key_for_session(uid, key_or_pass, mode)
+            self.backup_recovery_key_var.set("")
+            self._set_status("Encrypted backup created")
+            self.refresh_backup_page()
+            messagebox.showinfo("Backup", f"Encrypted backup saved.\n\n{out_path}")
+        except Exception as e:
+            self.logger.error("Recovery backup export: %s", e, exc_info=True)
+            messagebox.showerror("Backup export failed", str(e))
+
+    def _import_backup_file(self):
+        if not self.session:
+            return messagebox.showwarning("Backup", "Login first.")
+
+        path = (self.backup_import_path_var.get() or "").strip()
+        if not path:
+            return messagebox.showwarning("Backup", "Choose a backup file first.")
+        if not Path(path).exists():
+            return messagebox.showerror("Backup", "Backup file not found.")
+
+        passphrase = (self.backup_import_pass_var.get() or "").strip()
+        if not passphrase:
+            return messagebox.showwarning("Backup", "Type the password or key you used when you made this backup.")
+
+        backup_obj = None
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                backup_obj = json.load(f)
+        except (json.JSONDecodeError, UnicodeDecodeError, OSError):
+            # Binary or non-JSON file (e.g. .enc): treat as recovery-format backup; API will read from path
+            backup_obj = None
+        except Exception as e:
+            return messagebox.showerror("Backup", f"Could not read backup file: {e}")
+
+        cert = self._get_active_encryption_cert()
+        if not cert:
+            return messagebox.showerror("Backup", "No active encryption certificate available.")
+
+        # Support both formats: passphrase export (sv_backup_v2) and recovery backup (sv_backup_recovery_v1)
+        # If file could not be loaded as JSON (e.g. .enc), assume recovery format and pass path to API
+        is_recovery_format = backup_obj is None or (
+            backup_obj.get("format_version") == "sv_backup_recovery_v1"
+            or (backup_obj.get("key_verifier") is not None and backup_obj.get("encryption") is not None)
+        )
+        try:
+            if is_recovery_format:
+                ok, result = self.api.import_recovery_backup(
+                    self.session["user_id"], path, passphrase, cert
+                )
+            else:
+                ok, result = self.api.import_vault_backup(self.session["user_id"], cert, backup_obj, passphrase)
+        except Exception as e:
+            error_msg = f"Backup import error: {str(e)}"
+            self.logger.error("Backup import exception: %s", e, exc_info=True)
+            return messagebox.showerror("Backup import failed", error_msg)
+        
+        if not ok:
+            # FIXED: Handle result that might be a list or dict
+            if isinstance(result, dict):
+                error_msg = result.get("error") or result.get("message") or "Import failed"
+            elif isinstance(result, (list, tuple)):
+                error_msg = f"Import failed: {result[0] if result else 'Unknown error'}"
+            else:
+                error_msg = f"Import failed: {str(result)}"
+            self.logger.error("Backup import failed: %s", error_msg)
+            return messagebox.showerror("Backup import failed", error_msg)
+
+        # FIXED: Ensure result is a dict before accessing keys
+        if not isinstance(result, dict):
+            self.logger.error("Backup import returned unexpected type: %s", type(result).__name__)
+            return messagebox.showerror("Backup import failed", "Unexpected result format: " + type(result).__name__)
+
+        added = int(result.get("added", result.get("imported", 0)) or 0)
+        skipped = int(result.get("skipped", 0) or 0)
+        failed = int(result.get("failed", 0) or 0)
+
+        self.backup_import_pass_var.set("")
+        self._set_status(f"Backup imported: {added} added, {skipped} skipped, {failed} failed")
+        self.refresh_vault_table()
+        self.refresh_dashboard(force_health=True)
+        self.refresh_backup_page()
+
+        detail = f"Added: {added}\nSkipped: {skipped}\nFailed: {failed}"
+        errs = result.get("errors") or result.get("messages") or []
+        if errs:
+            preview = "\n".join(f"• {e}" for e in errs[:8])
+            detail += f"\n\nWarnings:\n{preview}"
+            if len(errs) > 8:
+                detail += f"\n• ... and {len(errs) - 8} more"
+        messagebox.showinfo("Backup import complete", detail)
+
+    def refresh_backup_page(self):
+        if not hasattr(self, "backup_events_box"):
+            return
+
+        self.backup_events_box.configure(state="normal")
+        self.backup_events_box.delete("1.0", "end")
+
+        if not self.session:
+            self.backup_events_box.insert("end", "Login to view backup activity.")
+            self.backup_events_box.configure(state="disabled")
+            if hasattr(self, "backup_recovery_status_var"):
+                self.backup_recovery_status_var.set("Login to view.")
+            return
+
+        # Backup recovery status (Phase 1)
+        if hasattr(self, "backup_recovery_status_var"):
+            try:
+                status = self.api.get_backup_recovery_status(int(self.session["user_id"]))
+                if status.get("enabled"):
+                    mode = status.get("mode") or "recovery_key"
+                    self.backup_recovery_status_var.set(f"Backup recovery: Enabled ({mode})")
+                else:
+                    self.backup_recovery_status_var.set("Backup recovery: Not enabled")
+            except Exception:
+                self.backup_recovery_status_var.set("Backup recovery: —")
+        # Phase 2: status, list, settings
+        if hasattr(self, "backup_phase2_status_var"):
+            try:
+                bs = self.api.get_backup_status(int(self.session["user_id"]))
+                parts = []
+                if bs.get("last_backup_at"):
+                    parts.append(f"Last backup: {bs['last_backup_at']}")
+                if bs.get("next_scheduled_due"):
+                    parts.append(f"Next due: {bs['next_scheduled_due']}")
+                parts.append(f"Local backups: {bs.get('local_backup_count', 0)}")
+                self.backup_phase2_status_var.set("  |  ".join(parts) if parts else "No backups yet.")
+            except Exception:
+                self.backup_phase2_status_var.set("")
+        if hasattr(self, "backup_listbox"):
+            try:
+                self.backup_listbox.delete(0, "end")
+                for b in self.api.list_local_backups(int(self.session["user_id"])):
+                    line = f"{b.get('created_at', '')}  {b.get('filename', '')}  ({b.get('size', 0)} B)"
+                    self.backup_listbox.insert("end", line)
+            except Exception:
+                pass
+        if hasattr(self, "backup_keep_n_var"):
+            try:
+                s = self.api.get_backup_settings(int(self.session["user_id"]))
+                self.backup_keep_n_var.set(str(s.get("keep_last_n_backups", 10)))
+                if hasattr(self, "backup_auto_var"):
+                    self.backup_auto_var.set(bool(s.get("backup_auto_enabled", False)))
+                if hasattr(self, "backup_on_change_var"):
+                    self.backup_on_change_var.set(bool(s.get("backup_on_change_enabled", False)))
+                if hasattr(self, "backup_schedule_hours_var"):
+                    self.backup_schedule_hours_var.set(str(s.get("schedule_interval_hours", 24)))
+                if hasattr(self, "backup_stale_days_var"):
+                    self.backup_stale_days_var.set(str(s.get("stale_warning_days", 7)))
+                if hasattr(self, "backup_on_change_debounce_var"):
+                    self.backup_on_change_debounce_var.set(str(s.get("on_change_debounce_seconds", 60)))
+            except Exception:
+                pass
+        if hasattr(self, "backup_folder_path_var"):
+            try:
+                path = self.api.get_backup_folder_path(int(self.session["user_id"]))
+                self.backup_folder_path_var.set(path or "")
+            except Exception:
+                self.backup_folder_path_var.set("")
+        if hasattr(self, "backup_health_summary_var"):
+            try:
+                bs = self.api.get_backup_status(int(self.session["user_id"]))
+                lines = []
+                lines.append("Recovery configured: " + ("Yes (" + (bs.get("mode") or "recovery_key") + ")" if bs.get("recovery_configured") else "No"))
+                lines.append("Scheduled backup: " + ("Yes" if bs.get("backup_auto_enabled") else "No") + "  |  Backup on change: " + ("Yes" if bs.get("backup_on_change_enabled") else "No"))
+                if bs.get("last_backup_at"):
+                    age = bs.get("last_backup_age_days")
+                    if age is not None and age >= 0:
+                        if age < 1:
+                            lines.append("Last backup: " + str(bs["last_backup_at"]) + " (today)")
+                        else:
+                            lines.append("Last backup: " + str(bs["last_backup_at"]) + " (" + str(int(age)) + " days ago)")
+                    else:
+                        lines.append("Last backup: " + str(bs["last_backup_at"]))
+                else:
+                    lines.append("Last backup: Never")
+                if bs.get("next_scheduled_due"):
+                    lines.append("Next scheduled: " + str(bs["next_scheduled_due"]))
+                lines.append("Local backups retained: " + str(bs.get("local_backup_count", 0)) + "  (keep last " + str(bs.get("keep_last_n_backups", 10)) + ")")
+                val = bs.get("latest_validation_ok")
+                if val is True:
+                    lines.append("Latest validation: Valid")
+                elif val is False:
+                    lines.append("Latest validation: Error (validation failed)")
+                else:
+                    lines.append("Latest validation: Not validated yet")
+                if bs.get("staleness_warning"):
+                    lines.append("⚠ " + bs["staleness_warning"])
+                lines.append("— " + (bs.get("restore_readiness") or ""))
+                self.backup_health_summary_var.set("\n".join(lines))
+            except Exception:
+                self.backup_health_summary_var.set("Unable to load health status.")
+
+        # FIXED: Proper database connection handling with context manager
+        try:
+            conn = self.api.db.get_connection()
+            try:
+                cursor = conn.cursor()
+                cursor.execute(
+                    """
+                    SELECT event_type, summary, created_at
+                    FROM backup_events
+                    WHERE user_id = ?
+                    ORDER BY id DESC
+                    LIMIT 30
+                    """,
+                    (int(self.session["user_id"]),),
+                )
+                rows = cursor.fetchall()
+            finally:
+                conn.close()
+        except Exception as e:
+            self.logger.error("Error loading backup events: %s", e)
+            rows = []
+
+        if not rows:
+            self.backup_events_box.insert("end", "No backup events yet.")
+        else:
+            for r in rows:
+                when = str(r["created_at"] or "")
+                event_type = str(r["event_type"] or "").upper()
+                try:
+                    meta = json.loads(r["summary"] or "{}")
+                except Exception:
+                    meta = {"raw": str(r["summary"])}
+                pairs = []
+                for k in ("entries", "added", "imported", "skipped", "failed", "format"):
+                    if k in meta:
+                        pairs.append(f"{k}={meta[k]}")
+                self.backup_events_box.insert("end", f"[{when}] {event_type}")
+                if pairs:
+                    self.backup_events_box.insert("end", "  " + ", ".join(pairs))
+                self.backup_events_box.insert("end", "\n")
+
+        self.backup_events_box.configure(state="disabled")
+
+    # ---------------------- activity log ----------------------
+    def _build_activity_log_page(self):
+        page = ttk.Frame(self.content)
+        page.columnconfigure(0, weight=1)
+        page.rowconfigure(0, weight=0)
+        page.rowconfigure(1, weight=0)
+        page.rowconfigure(2, weight=0)
+        page.rowconfigure(3, weight=0)
+        page.rowconfigure(4, weight=1)
+        page.rowconfigure(5, weight=0, minsize=140)
+
+        ttk.Label(page, text="Activity Log", style="Title.TLabel").grid(row=0, column=0, sticky="w")
+        ttk.Label(
+            page,
+            text="Recent security and app activity. Use search and filters to find entries.",
+            style="Sub.TLabel",
+        ).grid(row=1, column=0, sticky="w", pady=(0, 12))
+
+        # Recent Security Alerts: themed card (panel bg, border) to match dark theme
+        recent_alerts_frame = ttk.LabelFrame(page, text="Recent Security Alerts (last 5)", padding=10)
+        recent_alerts_frame.grid(row=2, column=0, sticky="ew", pady=(0, 12))
+        recent_alerts_frame.columnconfigure(0, weight=1)
+        recent_alerts_frame.rowconfigure(0, weight=0)
+        alerts_inner = ttk.Frame(recent_alerts_frame, style="Panel.TFrame")
+        alerts_inner.grid(row=0, column=0, sticky="nsew")
+        alerts_inner.columnconfigure(0, weight=1)
+        self.recent_alerts_listbox = tk.Listbox(
+            alerts_inner,
+            height=5,
+            font=self.font_base,
+            bg=self.palette.get("input_bg", self.palette["panel"]),
+            fg=self.palette["text"],
+            selectbackground=self.palette.get("accent", "#58a6ff"),
+            selectforeground=self.palette.get("accent_fg", "#ffffff"),
+            selectmode="single",
+            activestyle="none",
+            highlightthickness=1,
+            highlightbackground=self.palette["border"],
+            highlightcolor=self.palette["border"],
+        )
+        recent_alerts_sb = ttk.Scrollbar(alerts_inner, orient="vertical", command=self.recent_alerts_listbox.yview)
+        self.recent_alerts_listbox.configure(yscrollcommand=recent_alerts_sb.set)
+        self.recent_alerts_listbox.grid(row=0, column=0, sticky="nsew")
+        recent_alerts_sb.grid(row=0, column=1, sticky="ns")
+        ttk.Button(
+            recent_alerts_frame,
+            text="View full log below",
+            style="Secondary.TButton",
+            command=self._scroll_activity_log_to_table,
+        ).grid(row=1, column=0, sticky="w", pady=(8, 0))
+
+        # Toolbar: two rows — filters on row 0, action buttons grouped on row 1
+        toolbar = ttk.Frame(page)
+        toolbar.grid(row=3, column=0, sticky="ew", pady=(0, 10))
+        toolbar.columnconfigure(0, weight=0)
+        self.audit_search_var = tk.StringVar()
+        self.audit_search_var.trace_add("write", lambda *a: self._refresh_activity_log())
+        col = 0
+        ttk.Label(toolbar, text="Search:", style="ActivityLog.TLabel").grid(row=0, column=col, sticky="w", padx=(0, 6))
+        col += 1
+        search_entry = self._make_entry(toolbar, self.audit_search_var)
+        search_entry.config(width=22, font=self.font_base)
+        search_entry.grid(row=0, column=col, sticky="w", padx=(0, 16))
+        col += 1
+        ttk.Label(toolbar, text="Category:", style="ActivityLog.TLabel").grid(row=0, column=col, sticky="w", padx=(0, 4))
+        col += 1
+        self.audit_category_var = tk.StringVar(value="All")
+        _cat_opts = ["All", "Session", "Security", "Vault", "Backup", "Restore", "Extension", "API", "Settings", "System"]
+        _cat_frame = tk.Frame(toolbar, bg=self.palette["bg"])
+        _cat_frame.grid(row=0, column=col, sticky="w", padx=(0, 12))
+        _cat_btn = tk.Button(
+            _cat_frame,
+            textvariable=self.audit_category_var,
+            command=lambda: self._show_themed_dropdown(
+                _cat_btn, _cat_opts, self.audit_category_var.get(),
+                lambda v: (self.audit_category_var.set(v), self._refresh_activity_log()),
+                min_width=140,
+            ),
+            font=self.font_base,
+            bg=self.palette.get("card_soft", self.palette["panel"]),
+            fg=self.palette["text"],
+            activebackground=self.palette.get("accent_active", self.palette["accent"]),
+            activeforeground=self.palette.get("accent_fg", "white"),
+            relief="solid",
+            borderwidth=1,
+            highlightthickness=0,
+            width=10,
+            anchor="w",
+            padx=6,
+            pady=4,
+        )
+        _cat_btn.pack()
+        col += 1
+        ttk.Label(toolbar, text="Status:", style="ActivityLog.TLabel").grid(row=0, column=col, sticky="w", padx=(0, 4))
+        col += 1
+        self.audit_status_var = tk.StringVar(value="All")
+        _status_opts = ["All", "Success", "Warning", "Failed", "Info"]
+        _status_frame = tk.Frame(toolbar, bg=self.palette["bg"])
+        _status_frame.grid(row=0, column=col, sticky="w", padx=(0, 12))
+        _status_btn = tk.Button(
+            _status_frame,
+            textvariable=self.audit_status_var,
+            command=lambda: self._show_themed_dropdown(
+                _status_btn, _status_opts, self.audit_status_var.get(),
+                lambda v: (self.audit_status_var.set(v), self._refresh_activity_log()),
+                min_width=120,
+            ),
+            font=self.font_base,
+            bg=self.palette.get("card_soft", self.palette["panel"]),
+            fg=self.palette["text"],
+            activebackground=self.palette.get("accent_active", self.palette["accent"]),
+            activeforeground=self.palette.get("accent_fg", "white"),
+            relief="solid",
+            borderwidth=1,
+            highlightthickness=0,
+            width=10,
+            anchor="w",
+            padx=6,
+            pady=4,
+        )
+        _status_btn.pack()
+        col += 1
+        ttk.Label(toolbar, text="Date:", style="ActivityLog.TLabel").grid(row=0, column=col, sticky="w", padx=(0, 4))
+        col += 1
+        self.audit_date_var = tk.StringVar(value="All")
+        _date_opts = ["All", "Today", "Last 7 days", "Last 30 days"]
+        _date_frame = tk.Frame(toolbar, bg=self.palette["bg"])
+        _date_frame.grid(row=0, column=col, sticky="w", padx=(0, 12))
+        _date_btn = tk.Button(
+            _date_frame,
+            textvariable=self.audit_date_var,
+            command=lambda: self._show_themed_dropdown(
+                _date_btn, _date_opts, self.audit_date_var.get(),
+                lambda v: (self.audit_date_var.set(v), self._refresh_activity_log()),
+                min_width=140,
+            ),
+            font=self.font_base,
+            bg=self.palette.get("card_soft", self.palette["panel"]),
+            fg=self.palette["text"],
+            activebackground=self.palette.get("accent_active", self.palette["accent"]),
+            activeforeground=self.palette.get("accent_fg", "white"),
+            relief="solid",
+            borderwidth=1,
+            highlightthickness=0,
+            width=12,
+            anchor="w",
+            padx=6,
+            pady=4,
+        )
+        _date_btn.pack()
+        col += 1
+        ttk.Label(toolbar, text="Sort:", style="ActivityLog.TLabel").grid(row=0, column=col, sticky="w", padx=(0, 4))
+        col += 1
+        self.audit_sort_var = tk.StringVar(value="Time")
+        _sort_opts = ["Time", "Category", "Status", "Action"]
+        _sort_frame = tk.Frame(toolbar, bg=self.palette["bg"])
+        _sort_frame.grid(row=0, column=col, sticky="w", padx=(0, 8))
+        _sort_btn = tk.Button(
+            _sort_frame,
+            textvariable=self.audit_sort_var,
+            command=lambda: self._show_themed_dropdown(
+                _sort_btn, _sort_opts, self.audit_sort_var.get(),
+                lambda v: (self.audit_sort_var.set(v), self._refresh_activity_log()),
+                min_width=100,
+            ),
+            font=self.font_base,
+            bg=self.palette.get("card_soft", self.palette["panel"]),
+            fg=self.palette["text"],
+            activebackground=self.palette.get("accent_active", self.palette["accent"]),
+            activeforeground=self.palette.get("accent_fg", "white"),
+            relief="solid",
+            borderwidth=1,
+            highlightthickness=0,
+            width=8,
+            anchor="w",
+            padx=6,
+            pady=4,
+        )
+        _sort_btn.pack()
+        col += 1
+        self.audit_sort_desc_var = tk.BooleanVar(value=True)
+        self._make_checkbutton(
+            toolbar,
+            "Newest first",
+            self.audit_sort_desc_var,
+            background=self.palette["bg"],
+            command=self._refresh_activity_log,
+        ).grid(row=0, column=col, sticky="w", padx=(0, 12))
+        col += 1
+        self.audit_include_system_var = tk.BooleanVar(value=False)
+        self._make_checkbutton(
+            toolbar,
+            "Include system events",
+            self.audit_include_system_var,
+            background=self.palette["bg"],
+            command=self._refresh_activity_log,
+        ).grid(row=0, column=col, sticky="w", padx=(0, 12))
+        col += 1
+        toolbar.columnconfigure(col, weight=1)
+        # Action buttons grouped in one frame so they stay together (no large gaps)
+        toolbar_btns = ttk.Frame(toolbar)
+        toolbar_btns.grid(row=1, column=0, columnspan=col + 1, sticky="w", pady=(8, 0))
+        ttk.Button(toolbar_btns, text="Refresh", command=self._refresh_activity_log, style="Secondary.TButton").pack(side="left", padx=(0, 6))
+        ttk.Button(toolbar_btns, text="Clear filters", command=self._clear_activity_log_filters, style="Secondary.TButton").pack(side="left", padx=(0, 6))
+        ttk.Button(toolbar_btns, text="Export visible", command=self._export_activity_log_visible, style="Secondary.TButton").pack(side="left")
+
+        table_wrap = ttk.Frame(page)
+        table_wrap.grid(row=4, column=0, sticky="nsew")
+        table_wrap.columnconfigure(0, weight=1)
+        table_wrap.rowconfigure(0, weight=1)
+        cols = ("time", "category", "action", "status", "message")
+        self.audit_log_table = ttk.Treeview(
+            table_wrap,
+            columns=cols,
+            show="headings",
+            selectmode="browse",
+            height=16,
+        )
+        # Column widths and minwidth so headers (Time, Category, Action, Status, Message) are never truncated
+        for c, w, mw in [("time", 180, 70), ("category", 100, 80), ("action", 100, 80), ("status", 90, 70), ("message", 480, 150)]:
+            self.audit_log_table.heading(c, text=c.title())
+            self.audit_log_table.column(c, width=w, minwidth=mw, anchor="w")
+        self.audit_log_table.tag_configure("odd", background=self.palette["panel"], foreground=self.palette["text"])
+        self.audit_log_table.tag_configure("even", background=self.palette.get("table_row_alt", self.palette["panel"]), foreground=self.palette["text"])
+        self.audit_log_table.tag_configure("empty", background=self.palette["panel"], foreground=self.palette["muted"])
+        y_sb = ttk.Scrollbar(table_wrap, orient="vertical", command=self.audit_log_table.yview)
+        x_sb = ttk.Scrollbar(table_wrap, orient="horizontal", command=self.audit_log_table.xview)
+        self.audit_log_table.configure(yscrollcommand=y_sb.set, xscrollcommand=x_sb.set)
+        self.audit_log_table.grid(row=0, column=0, sticky="nsew")
+        y_sb.grid(row=0, column=1, sticky="ns")
+        x_sb.grid(row=1, column=0, sticky="ew")
+        self.audit_log_table.bind("<<TreeviewSelect>>", self._on_select_activity_log_row)
+
+        details_frame = ttk.LabelFrame(page, text="Details", padding=10)
+        details_frame.grid(row=5, column=0, sticky="nsew", pady=(12, 0))
+        details_frame.columnconfigure(0, weight=1)
+        details_frame.rowconfigure(0, weight=1)
+        self.audit_details_text = tk.Text(
+            details_frame,
+            height=6,
+            wrap="word",
+            bg=self.palette.get("input_bg", self.palette["panel"]),
+            fg=self.palette["text"],
+            font=self.font_base,
+            state="disabled",
+            relief="flat",
+            highlightthickness=1,
+            highlightbackground=self.palette["border"],
+            padx=8,
+            pady=6,
+        )
+        self.audit_details_text.grid(row=0, column=0, sticky="nsew")
+
+        self.audit_log_data = []
+        self.root.after(200, self._refresh_activity_log)
+        return page
+
+    def _scroll_activity_log_to_table(self):
+        """Scroll the Activity Log main table into view and focus it."""
+        if hasattr(self, "audit_log_table") and self.audit_log_table.winfo_exists():
+            self.audit_log_table.focus_set()
+            try:
+                self.audit_log_table.yview_moveto(0.0)
+            except Exception:
+                pass
+
+    def _clear_activity_log_filters(self):
+        self.audit_search_var.set("")
+        self.audit_category_var.set("All")
+        self.audit_status_var.set("All")
+        self.audit_date_var.set("All")
+        self.audit_sort_var.set("Time")
+        self.audit_sort_desc_var.set(True)
+        if getattr(self, "audit_include_system_var", None):
+            self.audit_include_system_var.set(False)
+        self._refresh_activity_log()
+
+    def _get_activity_log_date_range(self):
+        date_val = self.audit_date_var.get() or "All"
+        if date_val == "All":
+            return None, None
+        now = datetime.datetime.utcnow()
+        if date_val == "Today":
+            start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+            return start.strftime("%Y-%m-%d %H:%M:%S"), now.strftime("%Y-%m-%d %H:%M:%S")
+        if date_val == "Last 7 days":
+            start = now - datetime.timedelta(days=7)
+            return start.strftime("%Y-%m-%d %H:%M:%S"), now.strftime("%Y-%m-%d %H:%M:%S")
+        if date_val == "Last 30 days":
+            start = now - datetime.timedelta(days=30)
+            return start.strftime("%Y-%m-%d %H:%M:%S"), now.strftime("%Y-%m-%d %H:%M:%S")
+        return None, None
+
+    def _refresh_activity_log(self):
+        if not getattr(self, "audit_log_table", None):
+            return
+        for iid in self.audit_log_table.get_children():
+            self.audit_log_table.delete(iid)
+        self.audit_details_text.configure(state="normal")
+        self.audit_details_text.delete("1.0", "end")
+        self.audit_details_text.configure(state="disabled")
+        self.audit_log_data = []
+        try:
+            since_ts, until_ts = self._get_activity_log_date_range()
+            sort_by = self.audit_sort_var.get() or "Time"
+            sort_map = {"Time": "created_at", "Category": "category", "Status": "status", "Action": "action"}
+            sort_key = sort_map.get(sort_by, "created_at")
+            current_user_id = int(self.session["user_id"]) if self.session and self.session.get("user_id") else None
+            rows = self.api.list_audit_logs(
+                limit=500,
+                since_ts=since_ts,
+                until_ts=until_ts,
+                category=self.audit_category_var.get() if self.audit_category_var.get() != "All" else None,
+                status=self.audit_status_var.get() if self.audit_status_var.get() != "All" else None,
+                search=self.audit_search_var.get().strip() or None,
+                sort_by=sort_key,
+                sort_desc=self.audit_sort_desc_var.get(),
+                user_id=current_user_id,
+                include_system=bool(getattr(self, "audit_include_system_var", None) and self.audit_include_system_var.get()),
+            )
+            self.audit_log_data = rows
+            if getattr(self, "recent_alerts_listbox", None):
+                try:
+                    self.recent_alerts_listbox.delete(0, tk.END)
+                    for r in rows[:5]:
+                        ts = (r.get("timestamp") or "—")[:19]
+                        st = (r.get("status") or "—")[:10]
+                        msg = (r.get("message") or "—")[:60]
+                        self.recent_alerts_listbox.insert(tk.END, f"  {ts}  |  {st}  |  {msg}")
+                except Exception:
+                    pass
+            if not rows:
+                self.audit_log_table.insert("", "end", values=("—", "—", "—", "—", "No matching log entries."), tags=("empty",))
+            else:
+                for i, r in enumerate(rows):
+                    tag = "even" if i % 2 == 0 else "odd"
+                    self.audit_log_table.insert(
+                        "",
+                        "end",
+                        iid=str(i),
+                        values=(
+                            r.get("timestamp", "—"),
+                            r.get("category", "—"),
+                            r.get("action", "—"),
+                            r.get("status", "—"),
+                            (r.get("message") or "—")[:200],
+                        ),
+                        tags=(tag,),
+                    )
+        except Exception as e:
+            self.logger.debug("Activity log refresh: %s", e)
+            self.audit_log_table.insert("", "end", values=("—", "—", "—", "—", "Could not load logs."), tags=("empty",))
+
+    def _on_select_activity_log_row(self, _event=None):
+        if not getattr(self, "audit_details_text", None):
+            return
+        sel = self.audit_log_table.selection()
+        self.audit_details_text.configure(state="normal")
+        self.audit_details_text.delete("1.0", "end")
+        if not sel:
+            self.audit_details_text.configure(state="disabled")
+            return
+        iid = sel[0]
+        try:
+            idx = int(iid)
+            row = self.audit_log_data[idx] if 0 <= idx < len(self.audit_log_data) else None
+        except (ValueError, TypeError):
+            row = None
+        if not row:
+            self.audit_details_text.configure(state="disabled")
+            return
+        details_safe = row.get("details_safe") or {}
+        context_lines = []
+        for k in sorted(details_safe.keys()):
+            v = details_safe[k]
+            if isinstance(v, (dict, list)):
+                context_lines.append(f"{k}: {json.dumps(v)}")
+            else:
+                context_lines.append(f"{k}: {v}")
+        context_block = "\n".join(context_lines) if context_lines else "—"
+        lines = [
+            f"Time: {row.get('timestamp', '—')}",
+            f"Category: {row.get('category', '—')}",
+            f"Action: {row.get('action', '—')}",
+            f"Status: {row.get('status', '—')}",
+            f"Message: {row.get('message', '—')}",
+            f"Event code: {row.get('event_code', '—')}",
+            f"Source: {row.get('source', '—')}",
+            "",
+            "Context:",
+            context_block,
+        ]
+        self.audit_details_text.insert("1.0", "\n".join(lines))
+        self.audit_details_text.configure(state="disabled")
+
+    def _export_activity_log_visible(self):
+        if not self.audit_log_data:
+            messagebox.showinfo("Export", "No log entries to export.")
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("Text files", "*.txt"), ("All files", "*.*")],
+            title="Export activity log",
+        )
+        if not path:
+            return
+        try:
+            header = ["Time", "Category", "Action", "Status", "Message", "Event code", "Source"]
+            with open(path, "w", encoding="utf-8", newline="") as f:
+                if path.lower().endswith(".csv"):
+                    import csv as csv_module
+                    w = csv_module.writer(f)
+                    f.write("# Secure Vault Activity Log\n")
+                    w.writerow(header)
+                    for r in self.audit_log_data:
+                        w.writerow([
+                            r.get("timestamp", ""),
+                            r.get("category", ""),
+                            r.get("action", ""),
+                            r.get("status", ""),
+                            (r.get("message") or "").replace("\n", " "),
+                            r.get("event_code", ""),
+                            r.get("source", ""),
+                        ])
+                else:
+                    f.write("\t".join(header) + "\n")
+                    for r in self.audit_log_data:
+                        f.write(f"{r.get('timestamp', '')}\t{r.get('category', '')}\t{r.get('action', '')}\t{r.get('status', '')}\t{(r.get('message') or '').replace(chr(10), ' ')}\t{r.get('event_code', '')}\t{r.get('source', '')}\n")
+            messagebox.showinfo("Export", f"Exported {len(self.audit_log_data)} entries to {path}")
+        except Exception as e:
+            messagebox.showerror("Export failed", str(e))
+
+    # ---------------------- command palette ----------------------
+    def _open_command_palette(self, _event=None):
+        if getattr(self, "_palette_window", None) and self._palette_window.winfo_exists():
+            self._palette_window.focus_force()
+            return "break"
+
+        actions = [
+            ("Open Dashboard", lambda: self.show_page("dashboard")),
+            ("Open Vault", lambda: self.show_page("vault")),
+            ("Open Import", lambda: self.show_page("import")),
+            ("Open Backup", lambda: self.show_page("backup")),
+            ("Open Activity Log", lambda: self.show_page("activity_log")),
+            ("Open Sync", lambda: self.show_page("sync")),
+            ("Open Extension", lambda: self.show_page("extension")),
+            ("Refresh Vault", self.refresh_vault_table),
+            ("Refresh Dashboard", lambda: self.refresh_dashboard(force_health=True)),
+            ("Lock app", self._do_manual_lock),
+            ("Logout", self._logout),
+        ]
+
+        self._palette_actions = actions
+        self._palette_filtered = list(range(len(actions)))
+
+        width = 560
+        height = 360
+        x = self.root.winfo_rootx() + max(20, (self.root.winfo_width() - width) // 2)
+        y = self.root.winfo_rooty() + 72
+
+        win = tk.Toplevel(self.root)
+        self._palette_window = win
+        win.title("Command Palette")
+        win.geometry(f"{width}x{height}+{x}+{y}")
+        win.transient(self.root)
+        win.configure(bg=self.palette["bg"])
+        win.resizable(False, False)
+        win.grab_set()
+
+        card = ttk.Frame(win, style="Panel.TFrame", padding=12)
+        card.pack(fill="both", expand=True, padx=12, pady=12)
+
+        ttk.Label(card, text="Quick Actions", style="Header.TLabel").pack(anchor="w")
+        ttk.Label(card, text="Type to filter, press Enter to run", style="Sub.TLabel").pack(anchor="w", pady=(2, 8))
+
+        query = tk.StringVar()
+        entry = self._make_entry(card, query)
+        entry.pack(fill="x")
+
+        results = tk.Listbox(
+            card,
+            activestyle="none",
+            relief="flat",
+            bg=self.palette["panel"],
+            fg=self.palette["text"],
+            font=self.font_base,
+            borderwidth=0,
+            highlightthickness=0,
+            selectmode="browse",
+            selectbackground=self.palette["accent_soft"],
+            selectforeground=self.palette["text"],
+        )
+        results.pack(fill="both", expand=True, pady=(8, 0))
+
+        def _refill(*_args):
+            q = (query.get() or "").strip().lower()
+            self._palette_filtered = []
+            results.delete(0, "end")
+            for i, (name, _fn) in enumerate(self._palette_actions):
+                if (not q) or (q in name.lower()):
+                    self._palette_filtered.append(i)
+                    results.insert("end", name)
+            if results.size() > 0:
+                results.selection_clear(0, "end")
+                results.selection_set(0)
+                results.activate(0)
+
+        def _run_selected(_evt=None):
+            if results.size() == 0:
+                return "break"
+            pos = results.curselection()[0] if results.curselection() else 0
+            action_idx = self._palette_filtered[pos]
+            name, fn = self._palette_actions[action_idx]
+            try:
+                fn()
+                self._set_status(f"Action executed: {name}")
+            finally:
+                try:
+                    win.grab_release()
+                except Exception:
+                    pass
+                win.destroy()
+            return "break"
+
+        query.trace_add("write", _refill)
+        entry.bind("<Return>", _run_selected)
+        results.bind("<Double-Button-1>", _run_selected)
+        results.bind("<Return>", _run_selected)
+        win.bind("<Escape>", lambda _e: (win.grab_release(), win.destroy(), "break"))
+
+        _refill()
+        entry.focus_set()
+        return "break"
+
+    # ---------------------- sync ----------------------
+    def _build_sync_page(self):
+        page = ttk.Frame(self.content)
+        ttk.Label(page, text="Sync setup", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(page, text="Zero-cost sync using Syncthing", style="Sub.TLabel").pack(anchor="w", pady=(0, 10))
+
+        self.sync_folder_var = tk.StringVar()
+
+        row = ttk.Frame(page)
+        row.pack(fill="x", pady=(0, 8))
+        self.sync_entry = self._make_entry(row, self.sync_folder_var)
+        self.sync_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        ttk.Button(row, text="Choose folder", command=self._pick_sync_folder).pack(side="left")
+        ttk.Button(row, text="Save", command=self._save_sync_folder).pack(side="left", padx=(8, 0))
+
+        row2 = ttk.Frame(page)
+        row2.pack(fill="x", pady=(0, 8))
+        ttk.Button(row2, text="Check Syncthing", command=self.refresh_sync_page).pack(side="left")
+        ttk.Button(row2, text="Launch Syncthing", command=self._launch_syncthing).pack(side="left", padx=8)
+
+        self.sync_status = ttk.Label(page, text="", style="Sub.TLabel")
+        self.sync_status.pack(anchor="w", pady=(0, 8))
+
+        info_wrap = ttk.Frame(page, style="Panel.TFrame", padding=10)
+        info_wrap.pack(fill="both", expand=True)
+
+        self.sync_steps = tk.Text(
+            info_wrap,
+            wrap="word",
+            bg=self.palette.get("input_bg", self.palette["panel"]),
+            fg=self.palette["text"],
+            font=self.font_small
+        )
+        y = ttk.Scrollbar(info_wrap, orient="vertical", command=self.sync_steps.yview)
+        self.sync_steps.configure(yscrollcommand=y.set)
+
+        self.sync_steps.grid(row=0, column=0, sticky="nsew")
+        y.grid(row=0, column=1, sticky="ns")
+        info_wrap.rowconfigure(0, weight=1)
+        info_wrap.columnconfigure(0, weight=1)
+        return page
+
+    def _pick_sync_folder(self):
+        folder = filedialog.askdirectory(title="Choose sync folder")
+        if folder:
+            self.sync_folder_var.set(folder)
+
+    def _save_sync_folder(self):
+        folder = self.sync_folder_var.get().strip()
+        if not folder:
+            return messagebox.showwarning("Sync", "Select a folder.")
+        saved = self.sync_service.set_sync_folder(folder)
+        self._set_status(f"Sync folder saved: {saved}")
+        messagebox.showinfo("Sync", f"Sync folder set:\n{saved}")
+
+    def _launch_syncthing(self):
+        ok, msg = self.sync_service.launch_syncthing()
+        if ok:
+            messagebox.showinfo("Syncthing", msg)
+            self._set_status(msg)
+        else:
+            messagebox.showwarning("Syncthing", msg)
+        self.refresh_sync_page()
+
+    def refresh_sync_page(self):
+        self.sync_folder_var.set(self.sync_service.get_sync_folder())
+        installed = self.sync_service.is_syncthing_installed()
+        running = self.sync_service.is_syncthing_running()
+
+        self.sync_status.configure(text=f"Installed: {'Yes' if installed else 'No'}   Running: {'Yes' if running else 'No'}")
+
+        self.sync_steps.delete("1.0", "end")
+        for i, step in enumerate(self.sync_service.setup_steps(), start=1):
+            self.sync_steps.insert("end", f"{i}. {step}\n")
+
+    # ---------------------- extension ----------------------
+    def _build_extension_page(self):
+        page = ttk.Frame(self.content)
+        ttk.Label(page, text="Browser Extension Token", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(
+            page,
+            text="Manage your browser extension token. Regenerating the token will disconnect all extensions using the current token.",
+            style="Sub.TLabel",
+        ).pack(anchor="w", pady=(0, 16))
+
+        # Token display and management
+        token_frame = ttk.Frame(page, style="Panel.TFrame", padding=16)
+        token_frame.pack(fill="x", pady=(0, 16))
+        
+        ttk.Label(token_frame, text="Current Token", style="Sub.TLabel").pack(anchor="w", pady=(0, 8))
+        self.token_var = tk.StringVar(value=self.extension_server.token)
+        token_row = ttk.Frame(token_frame)
+        token_row.pack(fill="x", pady=(0, 12))
+        self.token_entry = self._make_entry(token_row, self.token_var)
+        self.token_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        ttk.Button(token_row, text="Copy Token", command=self._copy_token, style="Secondary.TButton").pack(side="left", padx=(0, 8))
+        ttk.Button(token_row, text="Regenerate Token", command=self._regenerate_token, style="Accent.TButton").pack(side="left")
+
+        # Token usage information
+        usage_frame = ttk.Frame(page, style="Panel.TFrame", padding=16)
+        usage_frame.pack(fill="x", pady=(0, 16))
+        
+        ttk.Label(usage_frame, text="Token Usage Information", style="Sub.TLabel").pack(anchor="w", pady=(0, 8))
+        self.token_usage_label = ttk.Label(
+            usage_frame,
+            text="No usage data available. Token will be tracked when extension makes requests.",
+            style="Sub.TLabel",
+            foreground=self.palette.get("muted", "#94a3b8")
+        )
+        self.token_usage_label.pack(anchor="w", pady=(0, 8))
+        
+        # Refresh usage button
+        ttk.Button(usage_frame, text="Refresh Usage Info", command=self._refresh_token_usage, style="Secondary.TButton").pack(anchor="w")
+        
+        # API control
+        api_frame = ttk.Frame(page, style="Panel.TFrame", padding=16)
+        api_frame.pack(fill="x", pady=(0, 8))
+        
+        ttk.Label(api_frame, text="Extension API Server", style="Sub.TLabel").pack(anchor="w", pady=(0, 8))
+        api_row = ttk.Frame(api_frame)
+        api_row.pack(fill="x")
+        ttk.Button(api_row, text="Start API", command=self._start_extension_api).pack(side="left", padx=(0, 8))
+        ttk.Button(api_row, text="Stop API", command=self._stop_extension_api, style="Secondary.TButton").pack(side="left")
+
+        self.ext_status = ttk.Label(page, text="", style="Sub.TLabel")
+        self.ext_status.pack(anchor="w", pady=(0, 8))
+        
+        # Refresh usage on page load
+        self._refresh_token_usage()
+
+        help_wrap = ttk.Frame(page, style="Panel.TFrame", padding=10)
+        help_wrap.pack(fill="both", expand=True)
+
+        self.ext_help = tk.Text(
+            help_wrap,
+            wrap="word",
+            bg=self.palette.get("input_bg", self.palette["panel"]),
+            fg=self.palette["text"],
+            font=self.font_small
+        )
+        y = ttk.Scrollbar(help_wrap, orient="vertical", command=self.ext_help.yview)
+        self.ext_help.configure(yscrollcommand=y.set)
+
+        self.ext_help.grid(row=0, column=0, sticky="nsew")
+        y.grid(row=0, column=1, sticky="ns")
+        help_wrap.rowconfigure(0, weight=1)
+        help_wrap.columnconfigure(0, weight=1)
+
+        self.ext_help.insert(
+            "end",
+            "1) Open browser extensions page and enable Developer Mode.\n"
+            "2) Click Load unpacked and choose the browser_extension folder.\n"
+            "3) In extension popup set API URL to http://127.0.0.1:5005 and paste token.\n"
+            "4) Keep desktop app logged in and API running.\n"
+            "5) Visit login page and use extension Autofill.\n",
+        )
+        self.ext_help.config(state="disabled")
+
+        return page
+
+    def _refresh_token_usage(self):
+        """Refresh and display token usage information."""
+        usage = self.extension_server.get_token_usage()
+        if usage:
+            browser = usage.get("browser", "Unknown")
+            device = usage.get("device", "Unknown")
+            last_used = usage.get("last_used", "")
+            
+            if last_used:
+                try:
+                    from datetime import datetime
+                    dt = datetime.fromisoformat(last_used.replace('Z', '+00:00'))
+                    last_used_str = dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+                except Exception:
+                    last_used_str = last_used[:19] if len(last_used) > 19 else last_used
+            else:
+                last_used_str = "Never"
+            
+            usage_text = f"Browser: {browser}\nDevice: {device}\nLast Used: {last_used_str}"
+            self.token_usage_label.configure(text=usage_text, foreground=self.palette.get("text", "#f0f6fc"))
+        else:
+            self.token_usage_label.configure(
+                text="No usage data available. Token will be tracked when extension makes requests.",
+                foreground=self.palette.get("muted", "#94a3b8")
+            )
+
+    def _regenerate_token(self):
+        """Regenerate extension token (disconnects all extensions using current token)."""
+        if not messagebox.askyesno(
+            "Regenerate Token",
+            "Regenerating the token will disconnect all browser extensions using the current token.\n\n"
+            "You will need to update the token in all your browser extensions.\n\n"
+            "Continue?"
+        ):
+            return
+        
+        token = self.extension_server.regenerate_token()
+        self.token_var.set(token)
+        self._refresh_token_usage()
+        self._set_status("Extension token regenerated - all extensions disconnected")
+        messagebox.showinfo("Token Regenerated", "New extension token generated.\n\nAll extensions using the old token have been disconnected.\n\nUpdate the token in your browser extensions.")
+
+    def _copy_token(self):
+        self._copy_to_clipboard(self.token_var.get(), "Token")
+
+    def _start_extension_api(self):
+        ok, msg = self.extension_server.start()
+        if ok:
+            self.ext_status.configure(text=f"✅ {msg}")
+            self._set_status(msg)
+            self._show_toast("Extension API started", "success")
+        else:
+            self.ext_status.configure(text=f"❌ Failed: {msg}")
+            self._set_status(f"Extension API failed: {msg}")
+            messagebox.showerror("Extension API", f"Failed to start extension API:\n{msg}")
+
+    def _stop_extension_api(self):
+        ok, msg = self.extension_server.stop()
+        if ok:
+            self.ext_status.configure(text=f"❌ {msg}")
+            self._set_status(msg)
+            self._show_toast("Extension API stopped", "info")
+        else:
+            self.ext_status.configure(text=f"⚠️ {msg}")
+            self._set_status(f"Extension API stop warning: {msg}")
+
+    def refresh_extension_page(self):
+        self.token_var.set(self.extension_server.token)
+        self._refresh_token_usage()
+        is_running = self.extension_server._httpd is not None
+        status_text = "Status: RUNNING · Endpoint: http://127.0.0.1:5005" if is_running else "Status: STOPPED"
+        self.ext_status.configure(text=status_text)
+
+    # ---------------------- session ----------------------
+    def _get_extension_session(self):
+        if hasattr(self, "session_security") and self.session_security.is_locked():
+            return None
+        return self.session
+
+    def _export_csv_flow(self):
+        if not self.session:
+            return messagebox.showwarning("Export", "Login first.")
+
+        # Re-auth gate for export
+        if not self._require_step_up_or_phrase("export_vault", "export vault to cleartext CSV"):
+            return
+
+        out_path = filedialog.asksaveasfilename(
+            title="Save vault as cleartext CSV",
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            initialfile=f"vault_export_{int(time.time())}.csv",
+        )
+        if not out_path:
+            return
+
+        try:
+            # Convert bytearray to bytes for API call
+            enc_priv_bytes = bytes(self.session["enc_priv"]) if isinstance(self.session["enc_priv"], bytearray) else self.session["enc_priv"]
+            csv_data = self.api.export_secrets_as_csv(self.session["user_id"], enc_priv_bytes)
+            if not csv_data:
+                return messagebox.showinfo("Export", "Vault is empty.")
+                
+            with open(out_path, "w", encoding="utf-8", newline="") as f:
+                f.write(csv_data)
+                
+            self._set_status("Vault exported to cleartext CSV")
+            messagebox.showinfo("Export Successful", f"Vault saved to cleartext CSV:\n{out_path}\n\nWARNING: This file is unencrypted!")
+        except Exception as e:
+            messagebox.showerror("Export Failed", str(e))
+    
+    def _export_json_flow(self):
+        """Export vault as JSON format."""
+        if not self.session:
+            return messagebox.showwarning("Export", "Login first.")
+
+        # Re-auth gate for export
+        if not self._require_phrase("export vault to cleartext JSON"):
+            return
+
+        out_path = filedialog.asksaveasfilename(
+            title="Save vault as cleartext JSON",
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+            initialfile=f"vault_export_{int(time.time())}.json",
+        )
+        if not out_path:
+            return
+
+        try:
+            # Convert bytearray to bytes for API call
+            enc_priv_bytes = bytes(self.session["enc_priv"]) if isinstance(self.session["enc_priv"], bytearray) else self.session["enc_priv"]
+            json_data = self.api.export_secrets_as_json(self.session["user_id"], enc_priv_bytes)
+            if not json_data or json_data == "[]":
+                return messagebox.showinfo("Export", "Vault is empty.")
+                
+            with open(out_path, "w", encoding="utf-8") as f:
+                f.write(json_data)
+                
+            self._set_status("Vault exported to cleartext JSON")
+            messagebox.showinfo("Export Successful", f"Vault saved to cleartext JSON:\n{out_path}\n\nWARNING: This file is unencrypted!")
+        except Exception as e:
+            messagebox.showerror("Export Failed", str(e))
+
+    def _logout(self):
+        # CRITICAL SECURITY FIX: Wipe all sensitive data before logout
+        self._clear_hard_expiry_check()
+        self._full_clear_for_logout()
+        self.session_security.on_logout()  # runs clear callbacks (Phase 6.1)
+        # Cancel all pending timers/jobs
+        self._clear_idle_lock()
+        if self._clipboard_clear_job:
+            try:
+                self.root.after_cancel(self._clipboard_clear_job)
+            except Exception:
+                pass
+            self._clipboard_clear_job = None
+        
+        # Cancel undo buffer job if exists
+        if self._undo_buffer and self._undo_buffer.get("job_id"):
+            try:
+                self.root.after_cancel(self._undo_buffer["job_id"])
+            except Exception:
+                pass
+            self._undo_buffer = None
+        # Cancel backup timer (Phase 2)
+        if self._backup_timer:
+            try:
+                self.root.after_cancel(self._backup_timer)
+            except Exception:
+                pass
+            self._backup_timer = None
+        if self._backup_cred_prompt_job:
+            try:
+                self.root.after_cancel(self._backup_cred_prompt_job)
+            except Exception:
+                pass
+            self._backup_cred_prompt_job = None
+        # Sensitive caches already cleared by session_security.on_logout() callback
+        if self.session:
+            self.session.clear()
+        self.session = None
+        self.current_user = None
+        self._current_session_id = None
+
+        # Clear clipboard
+        try:
+            self._clear_clipboard_windows()
+        except Exception:
+            pass
+        
+        self.extension_server.stop()
+        self.session = None
+        self.current_user = None
+        self.health_cache = {"timestamp": 0.0, "data": None}
+        self.health_loading = False
+        self.import_rows = []
+        self.import_show_passwords = False
+        self._clipboard_nonce = None
+        self._build_login_view()
+        self._set_status("Logged out")
+
+
+# ---------------------- app bootstrap ----------------------
+def _enable_high_dpi():
+    if sys.platform.startswith("win"):
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)
+        except Exception:
+            try:
+                ctypes.windll.user32.SetProcessDPIAware()
+            except Exception:
+                pass
+
+
+def _apply_scaling(root: tk.Tk):
+    try:
+        dpi = float(root.winfo_fpixels("1i"))
+        scale = max(1.0, min(2.0, dpi / 96.0))
+        root.tk.call("tk", "scaling", scale)
+    except Exception:
+        pass
+
+
+def _fit_to_screen(root: tk.Tk):
+    """Set initial window size and position - DEPRECATED: Use app's _set_auth_window instead"""
+    try:
+        root.update_idletasks()
+        sw = root.winfo_screenwidth()
+        sh = root.winfo_screenheight()
+
+        w = min(980, int(sw * 0.72))
+        h = min(660, int(sh * 0.76))
+
+        w = max(820, min(w, sw - 40))
+        h = max(560, min(h, sh - 60))
+
+        x = max(0, (sw - w) // 2)
+        y = max(0, (sh - h) // 2)
+
+        root.geometry(f"{w}x{h}+{x}+{y}")
+        root.minsize(820, 560)
+    except Exception:
+        # Fallback to safe defaults
+        root.geometry("980x660")
+    root.minsize(820, 560)
+
+
+def main():
+    """Main entry point for the desktop application."""
+    # Enable high DPI awareness for Windows
+    _enable_high_dpi()
+    
+    # Create root window
+    root = tk.Tk()
+    
+    # Set window properties before creating app
+    root.title("Secure Vault Desktop")
+    
+    # Apply DPI scaling
+    _apply_scaling(root)
+    
+    # Set initial size before creating app
+    root.update_idletasks()
+    sw = root.winfo_screenwidth()
+    sh = root.winfo_screenheight()
+    initial_w = min(1600, int(sw * 0.92))
+    initial_h = min(1000, int(sh * 0.92))
+    initial_x = (sw - initial_w) // 2
+    initial_y = (sh - initial_h) // 2
+    root.geometry(f"{initial_w}x{initial_h}+{initial_x}+{initial_y}")
+    root.minsize(1400, 900)
+    root.resizable(True, True)
+    
+    # Create app instance (this will refine the window geometry)
+    app = VaultTkApp(root)
+    
+    # IMPROVED: Final verification and adjustment
+    try:
+        root.update_idletasks()
+        
+        # Verify window is on screen and properly sized
+        sw = root.winfo_screenwidth()
+        sh = root.winfo_screenheight()
+        x = root.winfo_x()
+        y = root.winfo_y()
+        w = root.winfo_width()
+        h = root.winfo_height()
+        
+        # If window is off-screen or too small, fix it
+        if x < 0 or y < 0 or x + w > sw or y + h > sh or w < 900 or h < 600:
+            w = max(900, min(w, sw - 40))
+            h = max(600, min(h, sh - 60))
+            x = max(0, (sw - w) // 2)
+            y = max(0, (sh - h) // 2)
+            root.geometry(f"{w}x{h}+{x}+{y}")
+        
+        # Ensure window is visible and open full screen (maximized)
+        root.deiconify()
+        try:
+            root.state("zoomed")
+        except Exception:
+            try:
+                root.attributes("-zoomed", True)
+            except Exception:
+                try:
+                    sw = root.winfo_screenwidth()
+                    sh = root.winfo_screenheight()
+                    root.geometry(f"{sw}x{sh}+0+0")
+                except Exception:
+                    pass
+        root.lift()
+        root.focus_force()
+    except Exception as e:
+        # Fallback: center window with large defaults
+        root.geometry("1600x1000")
+        root.update_idletasks()
+        sw = root.winfo_screenwidth()
+        sh = root.winfo_screenheight()
+        x = (sw - 1600) // 2
+        y = (sh - 1000) // 2
+        root.geometry(f"1600x1000+{x}+{y}")
+        root.minsize(1400, 900)
+        root.resizable(True, True)
+    
+    # Start main event loop
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
