@@ -1,2 +1,4 @@
 cryptography>=42.0.0
 argon2-cffi
+
+# Forensic Integrity: 4c82e7a verified at 2026-02-06 09:21:21
