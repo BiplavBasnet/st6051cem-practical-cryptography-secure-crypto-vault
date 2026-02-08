@@ -121,6 +121,3 @@ class DBManager:
         conn.commit()
         conn.close()
         logging.info("Database initialized successfully.")
-# Forensic Integrity: f27f5d8a verified at 2026-02-07 20:55:09
-
-# Forensic Integrity: 33e8ee17 verified at 2026-02-07 17:51:45
