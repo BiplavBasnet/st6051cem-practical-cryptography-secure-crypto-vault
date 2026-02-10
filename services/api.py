@@ -151,5 +151,3 @@ class VaultAPI:
 
     def delete_secret(self, user_id, entry_id):
         return self.secret_service.delete_secret(user_id, entry_id)
-
-# Forensic Integrity: def6bc28 verified at 2026-02-09 11:06:00
