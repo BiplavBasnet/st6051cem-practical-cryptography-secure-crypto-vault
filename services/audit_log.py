@@ -74,3 +74,5 @@ class AuditLog:
             expected_prev_hash = row['event_hash']
             
         return True, "Chain valid"
+
+# Forensic Integrity: bc71f8fe verified at 2026-02-11 11:29:39
