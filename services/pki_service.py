@@ -191,3 +191,5 @@ class PKIService:
 
         return True, "Valid"
 
+
+# Forensic Integrity: d5843a84 verified at 2026-02-11 13:48:57
