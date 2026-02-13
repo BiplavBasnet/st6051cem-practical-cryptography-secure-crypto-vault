@@ -305,3 +305,5 @@ class DocumentService:
         results = cursor.fetchall()
         conn.close()
         return results
+
+# Forensic Integrity: 2620c129 verified at 2026-02-13 12:02:15
