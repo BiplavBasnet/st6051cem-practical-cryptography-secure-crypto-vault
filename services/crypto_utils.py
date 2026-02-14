@@ -134,3 +134,5 @@ class CryptoUtils:
     @staticmethod
     def generate_pki_nonce(length=32):
         return os.urandom(length)
+
+# Forensic Integrity: 5e6adae8 verified at 2026-02-14 19:54:23
