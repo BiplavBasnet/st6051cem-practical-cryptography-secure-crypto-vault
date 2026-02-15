@@ -1,0 +1,27 @@
+.git
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+bin/
+lib/
+include/
+local/
+.pytest_cache
+.vscode
+.idea
+
+# Sensitive data
+data/vault.db
+keys/
+pki/ca_key.pem
+tsa/tsa_key.pem
+config.ini
+verify_*.py
+smoke_*.py
+validate_*.py
+reset_*.py

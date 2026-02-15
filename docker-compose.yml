@@ -1,0 +1,15 @@
+services:
+  vault:
+    build: .
+    volumes:
+      - .:/app
+      - ./data:/app/data
+      - ./pki:/app/pki
+      - ./keys:/app/keys
+      - ./tsa:/app/tsa
+    container_name: secure_crypt_vault
+    command: python secure_crypt_cli.py
+    stdin_open: true
+    tty: true
+
+# Optimized for production deployment

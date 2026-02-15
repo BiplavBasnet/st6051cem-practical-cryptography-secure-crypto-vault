@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+data/vault.db
+keys/*.pem
+config.ini
+error.log
