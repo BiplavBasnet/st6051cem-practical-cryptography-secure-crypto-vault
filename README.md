@@ -167,13 +167,20 @@ SecureCrypt-Vault/
 │   ├── cleanup_local_artifacts.py # Cleanup utility
 │   └── smoke_check.py         # Quick validation tests
 │
-└── tests/
-    ├── __init__.py
-    ├── test_vault.py          # Core vault tests
-    ├── test_hardening.py      # Security hardening tests
-    ├── test_audit_log.py      # Audit chain tests
-    ├── test_fuzz.py           # Fuzz/negative tests
-    └── test_ui_services.py    # UI integration tests
+├── tests/
+│   ├── __init__.py
+│   ├── test_vault.py          # Core vault tests
+│   ├── test_hardening.py      # Security hardening tests
+│   ├── test_audit_log.py      # Audit chain tests
+│   ├── test_fuzz.py           # Fuzz/negative tests
+│   └── test_ui_services.py    # UI integration tests
+│
+└── browser_extension/
+    ├── manifest.json          # Chrome extension manifest (v3)
+    ├── background.js          # Service worker for auth detection
+    ├── content.js             # Page injection for autofill
+    ├── popup.html             # Extension popup UI
+    └── popup.js               # Popup logic and API calls
 ```
 
 ---
@@ -184,7 +191,8 @@ SecureCrypt-Vault/
 
 - **Python 3.10 or higher**
 - **pip** (Python package manager)
-- **Windows 10/11** (for desktop notifications)
+- **Windows 10/11, macOS, or Linux**
+- **Chrome/Edge/Brave** (for browser extension)
 
 ### Step-by-Step Installation
 
@@ -263,6 +271,30 @@ python secure_crypt_cli.py backup
 # Restore from backup
 python secure_crypt_cli.py restore
 ```
+
+### Installing the Browser Extension
+
+The browser extension enables autofill functionality in Chrome, Edge, or Brave.
+
+1. **Open browser extensions page**
+   - Chrome: `chrome://extensions`
+   - Edge: `edge://extensions`
+   - Brave: `brave://extensions`
+
+2. **Enable Developer Mode** (toggle in top-right)
+
+3. **Click "Load unpacked"** and select the `browser_extension/` folder
+
+4. **Configure the extension**
+   - Click the extension icon in your browser toolbar
+   - Ensure API URL is `http://127.0.0.1:5005`
+   - Copy the token from the desktop app (Settings > Extension Token)
+   - Click "Test Connection" to verify
+
+5. **Usage**
+   - Keep the desktop app running and logged in
+   - Visit any login page - the extension will offer to autofill
+   - After successful login, it will offer to save new credentials
 
 ### Quick Smoke Test
 

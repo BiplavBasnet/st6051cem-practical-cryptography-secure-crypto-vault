@@ -1,0 +1,23 @@
+
+{
+  "manifest_version": 3,
+  "name": "Secure Vault Autofill",
+  "version": "1.0.0",
+  "description": "Autofill credentials from local Secure Vault desktop app",
+  "permissions": ["activeTab", "storage", "scripting", "tabs", "webNavigation"],
+  "host_permissions": ["http://127.0.0.1:5005/*", "http://*/*", "https://*/*"],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "action": {
+    "default_title": "Secure Vault",
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [
+    {
+      "matches": ["http://*/*", "https://*/*"],
+      "js": ["content.js"],
+      "run_at": "document_idle"
+    }
+  ]
+}
