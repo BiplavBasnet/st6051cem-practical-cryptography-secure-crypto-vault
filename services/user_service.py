@@ -316,7 +316,7 @@ class UserService:
         cursor = conn.cursor()
         cursor.execute("SELECT user_id FROM certificates WHERE serial_number = ? LIMIT 1", (serial_number,))
         row = cursor.fetchone()
-        user_id = int(row["user_id"]) if row and row.get("user_id") is not None else None
+        user_id = int(row["user_id"]) if row and row["user_id"] is not None else None
         cursor.execute("UPDATE certificates SET revoked = 1 WHERE serial_number = ?", (serial_number,))
         changed = cursor.rowcount
         conn.commit()
