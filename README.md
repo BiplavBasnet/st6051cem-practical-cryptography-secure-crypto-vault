@@ -94,10 +94,8 @@ A forensic-grade, enterprise-level password manager and secure document vault bu
 
 | Package | Version | Purpose |
 |---------|---------|---------|
-| `cryptography` | ≥41.0.0 | Core cryptographic operations (AES, RSA, X.509) |
+| `cryptography` | ≥42.0.0 | Core cryptographic operations (AES, RSA, X.509) |
 | `argon2-cffi` | ≥23.1.0 | Argon2id key derivation function |
-| `typer` | ≥0.9.0 | CLI interface framework |
-| `rich` | ≥13.0.0 | Terminal formatting and progress bars |
 | `winotify` | ≥1.1.0 | Windows desktop notifications |
 
 ### Built-in Libraries
@@ -126,7 +124,6 @@ A forensic-grade, enterprise-level password manager and secure document vault bu
 ```
 SecureCrypt-Vault/
 ├── run_tk_desktop.py          # GUI entry point
-├── secure_crypt_cli.py        # CLI entry point
 ├── desktop_tkinter_app.py     # Main GUI application
 ├── requirements.txt           # Python dependencies
 ├── README.md                  # This file
@@ -244,33 +241,6 @@ This launches the full graphical interface with:
 - Password vault management
 - Settings and preferences
 - Backup and restore
-
-### Running the Command-Line Interface (CLI)
-
-```bash
-python secure_crypt_cli.py --help
-```
-
-Available CLI commands:
-```bash
-# Register a new user
-python secure_crypt_cli.py register
-
-# Add a new secret
-python secure_crypt_cli.py add-secret
-
-# List all secrets
-python secure_crypt_cli.py list-secrets
-
-# Generate a secure password
-python secure_crypt_cli.py generate-password
-
-# Create a backup
-python secure_crypt_cli.py backup
-
-# Restore from backup
-python secure_crypt_cli.py restore
-```
 
 ### Installing the Browser Extension
 

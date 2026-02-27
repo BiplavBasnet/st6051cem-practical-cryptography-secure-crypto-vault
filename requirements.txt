@@ -1,5 +1,3 @@
 cryptography>=42.0.0
 argon2-cffi
-typer
-rich
 winotify>=1.1.0 ; platform_system=="Windows"
