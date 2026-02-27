@@ -23,11 +23,15 @@ from services.session_security_service import (
 
 
 # Phase 6.5: Central API security gate (order: auth -> expired -> step-up)
-# Note: App locked state does NOT block extension; only session expired does.
-def _check_sensitive_request(session, api, action_name: str):
+# Extension is allowed when app is locked - user must still enter master phrase for decryption.
+# This enables autofill functionality even when the desktop app is locked.
+def _check_sensitive_request(session, api, action_name: str, allow_when_locked: bool = True):
     """
     Returns (allowed: bool, payload: dict | None, audit_event: str | None, user_id: int | None).
     If not allowed, payload is the structured error for 403 response; audit_event is for logging.
+    
+    When allow_when_locked=True (default for extension), locked state does not block requests.
+    Security is maintained because user must still enter master phrase to decrypt passwords.
     """
     if not session or not isinstance(session, dict) or "user_id" not in session:
         return False, get_api_error_payload(
@@ -35,16 +39,20 @@ def _check_sensitive_request(session, api, action_name: str):
         ), "api_request_denied_auth_required", None
     user_id = session.get("user_id")
     sec = getattr(api, "session_security", None)
-    if sec and sec.is_locked():
+    
+    # Only block locked state if explicitly requested (allow_when_locked=False)
+    # Extension requests are allowed when locked since master phrase provides security
+    if sec and sec.is_locked() and not allow_when_locked:
         return False, get_api_error_payload(
             API_DENIAL_APP_LOCKED, "App is locked. Unlock the desktop app to use autofill."
         ), "api_request_denied_locked", user_id
+    
     if sec and sec.is_hard_expired():
         return False, get_api_error_payload(
             API_DENIAL_SESSION_EXPIRED, "Session expired. Sign in again."
         ), "api_request_denied_session_expired", user_id
     if sec:
-        ok, err = sec.require_step_up_for_action(action_name, allow_when_locked=True)
+        ok, err = sec.require_step_up_for_action(action_name, allow_when_locked=allow_when_locked)
         if not ok and err:
             reason = err.get("reason", API_DENIAL_REAUTH_REQUIRED)
             msg = err.get("message", "Re-auth required for autofill.")

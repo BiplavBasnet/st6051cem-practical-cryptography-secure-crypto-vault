@@ -6827,8 +6827,8 @@ class VaultTkApp:
 
     # ---------------------- session ----------------------
     def _get_extension_session(self):
-        if hasattr(self, "session_security") and self.session_security.is_locked():
-            return None
+        # Return session even when locked - extension requires master phrase for security
+        # This allows autofill to work when app is locked (user must still enter passphrase)
         return self.session
 
     def _export_csv_flow(self):
