@@ -5214,6 +5214,9 @@ class VaultTkApp:
         save_row.pack(anchor="w", pady=(6, 0))
         ttk.Button(save_row, text="Save credentials for this session", style="Secondary.TButton", command=self._on_save_backup_credentials).pack(side="left", padx=(0, 8))
         ttk.Label(save_row, text="(enables auto backup until logout)", style="Sub.TLabel").pack(side="left")
+        self.backup_cred_status_var = tk.StringVar(value="")
+        self.backup_cred_status_label = ttk.Label(save_row, textvariable=self.backup_cred_status_var, style="Sub.TLabel", foreground="green")
+        self.backup_cred_status_label.pack(side="left", padx=(12, 0))
         ttk.Label(recovery_frame, text="If you use a recovery key: save it somewhere safe. The app shows it only once.", style="Sub.TLabel", wraplength=700).pack(anchor="w", pady=(8, 0))
 
         # ── 2) Local Backups (Phase 5) — grid layout for alignment and resize ──
@@ -5951,6 +5954,16 @@ class VaultTkApp:
                     self.backup_recovery_status_var.set("Backup recovery: Not enabled")
             except Exception:
                 self.backup_recovery_status_var.set("Backup recovery: —")
+        # Credentials cached status
+        if hasattr(self, "backup_cred_status_var"):
+            try:
+                bs = self.api.get_backup_status(int(self.session["user_id"]))
+                if bs.get("credentials_cached_for_session"):
+                    self.backup_cred_status_var.set("✓ Credentials saved for this session")
+                else:
+                    self.backup_cred_status_var.set("")
+            except Exception:
+                self.backup_cred_status_var.set("")
         # Phase 2: status, list, settings
         if hasattr(self, "backup_phase2_status_var"):
             try:

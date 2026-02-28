@@ -1106,6 +1106,7 @@ class BackupService:
             "Recovery is possible if you have a valid local backup and your Backup Recovery Key or Backup Password."
             if status.get("enabled") else "Enable Backup Recovery Key or Backup Password to allow restore from backup."
         )
+        credentials_cached = user_id in self._cached_auto_backup_key
         return {
             "enabled": status.get("enabled", False),
             "mode": status.get("mode"),
@@ -1126,4 +1127,5 @@ class BackupService:
             "restore_readiness": restore_readiness,
             "backup_folder_path": self.get_backup_folder_path(user_id),
             "stale_warning_days": settings.get("stale_warning_days", STALE_WARNING_DAYS_DEFAULT),
+            "credentials_cached_for_session": credentials_cached,
         }
