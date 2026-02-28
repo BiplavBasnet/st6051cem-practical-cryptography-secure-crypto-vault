@@ -957,7 +957,12 @@ class VaultTkApp:
         self._transition_to_locked_ui(reason="idle")
 
     def _transition_to_locked_ui(self, reason: str = "manual"):
-        """Switch UI to lock screen; vault content is already hidden by clearing root."""
+        """Switch UI to lock screen; vault content is already hidden by clearing root.
+        
+        Note: Backup timer continues running while locked. The backup credentials
+        (cached in backup_service) and enc_priv (in session) are preserved.
+        Extension server also continues to allow autofill when locked.
+        """
         if reason == "idle":
             msg = "App locked due to inactivity. Unlock to continue."
         else:
@@ -965,6 +970,9 @@ class VaultTkApp:
         self._set_status(msg)
         self._show_toast(msg, "warning")
         self._build_lock_screen(reason=reason)
+        # Ensure backup timer continues running while locked
+        if not self._backup_timer and self.session:
+            self._schedule_backup_tick()
 
     def _build_lock_screen(self, reason: str = "manual"):
         """Phase 6.2: Lock screen – no vault content; unlock passphrase + Logout."""
@@ -3132,7 +3140,11 @@ class VaultTkApp:
         self._backup_timer = self.root.after(60000, self._tick_backup_jobs)
 
     def _tick_backup_jobs(self):
-        """Run pending backup jobs (scheduled/change-triggered) without blocking UI."""
+        """Run pending backup jobs (scheduled/change-triggered) without blocking UI.
+        
+        This runs even when the app is locked - backup credentials are cached in
+        backup_service and enc_priv is preserved during lock (only cleared on logout).
+        """
         self._backup_timer = None
         if not self.session:
             return
@@ -3143,7 +3155,8 @@ class VaultTkApp:
                 return
             enc_priv_bytes = bytes(enc_priv) if isinstance(enc_priv, bytearray) else enc_priv
             did_run, msg = self.api.process_pending_backup_jobs(int(self.session["user_id"]), enc_priv_bytes)
-            if did_run and hasattr(self, "backup_phase2_status_var"):
+            # Only refresh UI if not locked and page exists
+            if did_run and hasattr(self, "backup_phase2_status_var") and not self.session_security.is_locked():
                 try:
                     self.refresh_backup_page()
                 except Exception as re:
