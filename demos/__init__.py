@@ -1,1 +1,0 @@
-# SecureCrypt Vault - Demonstration Scripts
