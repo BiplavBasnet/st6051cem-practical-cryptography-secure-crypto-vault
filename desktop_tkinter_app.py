@@ -33,6 +33,7 @@ from services.security_alert_service import (
     SEVERITY_INFO,
     SEVERITY_WARNING,
 )
+from services.status_bus import get_bus, StatusContext
 from config.design_tokens import THEMES, STRENGTH_COLOURS, STRENGTH_LABELS, get_theme
 
 
@@ -150,6 +151,11 @@ class VaultTkApp:
         self.api.set_session_security(self.session_security)  # for localhost API lock checks (Phase 6.x)
 
         self._setup_style()
+        
+        # Initialize the persistent status terminal dock (visible across all views)
+        self._build_status_terminal_dock()
+        self._start_status_poller()
+        
         self._set_auth_window()
         self._build_login_view()
 
@@ -614,7 +620,723 @@ class VaultTkApp:
     # ---------------------- helpers ----------------------
     def _clear_root(self):
         for child in self.root.winfo_children():
+            # Preserve the status terminal dock and show bar (persistent across all views)
+            if child == getattr(self, "_status_terminal_frame", None):
+                continue
+            if child == getattr(self, "_show_terminal_bar", None):
+                continue
             child.destroy()
+
+    # ---------------------- Status Terminal Dock (Persistent) ----------------------
+    def _build_status_terminal_dock(self):
+        """
+        Build the persistent status terminal dock at the bottom of root.
+        This dock remains visible across all views (login, register, main).
+        Features: resize, pin, hide/show, collapse/expand.
+        """
+        # Configuration
+        self._status_terminal_height = 160
+        self._status_terminal_min_height = 80
+        self._status_terminal_max_height = 400
+        self._status_terminal_collapsed = False
+        self._status_terminal_hidden = False
+        self._status_terminal_pinned = True
+        self._status_terminal_autoscroll = True
+        self._status_terminal_max_lines = 400
+        self._resize_dragging = False
+        
+        # Main container frame
+        self._status_terminal_frame = tk.Frame(self.root, bg=self.palette.get("panel", "#1e1e1e"))
+        self._status_terminal_frame.pack(side="bottom", fill="x")
+        
+        # Resize handle at top (drag to resize)
+        self._resize_handle = tk.Frame(
+            self._status_terminal_frame,
+            bg=self.palette.get("muted", "#444444"),
+            height=4,
+            cursor="sb_v_double_arrow",
+        )
+        self._resize_handle.pack(side="top", fill="x")
+        self._resize_handle.bind("<Button-1>", self._start_resize)
+        self._resize_handle.bind("<B1-Motion>", self._do_resize)
+        self._resize_handle.bind("<ButtonRelease-1>", self._stop_resize)
+        
+        # Header row with controls
+        header = tk.Frame(self._status_terminal_frame, bg=self.palette.get("panel", "#1e1e1e"))
+        header.pack(side="top", fill="x", padx=8, pady=(4, 0))
+        
+        # Title
+        title_lbl = tk.Label(
+            header,
+            text="Process Monitor",
+            font=self.font_nav,
+            bg=self.palette.get("panel", "#1e1e1e"),
+            fg=self.palette.get("text", "#ffffff"),
+        )
+        title_lbl.pack(side="left", padx=(4, 12))
+        
+        # View Full Report button
+        details_btn = tk.Button(
+            header,
+            text="View Report",
+            relief="flat",
+            bg=self.palette.get("accent", "#3b82f6"),
+            fg=self.palette.get("accent_fg", "white"),
+            font=self.font_small,
+            padx=8,
+            pady=2,
+            cursor="hand2",
+            command=self._show_process_viewer,
+        )
+        details_btn.pack(side="right", padx=4)
+        
+        # Hide button (minimize to tiny bar)
+        self._hide_btn = tk.Button(
+            header,
+            text="Hide",
+            relief="flat",
+            bg=self.palette.get("panel", "#1e1e1e"),
+            fg=self.palette.get("muted", "#888888"),
+            font=self.font_small,
+            padx=6,
+            cursor="hand2",
+            command=self._hide_status_terminal,
+        )
+        self._hide_btn.pack(side="right", padx=2)
+        
+        # Pin toggle (keep always visible)
+        self._pin_btn = tk.Button(
+            header,
+            text="📌",
+            relief="flat",
+            bg=self.palette.get("panel", "#1e1e1e"),
+            fg=self.palette.get("success", "#22c55e"),
+            font=self.font_small,
+            width=3,
+            cursor="hand2",
+            command=self._toggle_pin_terminal,
+        )
+        self._pin_btn.pack(side="right", padx=2)
+        
+        # Collapse/Expand toggle
+        self._status_collapse_btn = tk.Button(
+            header,
+            text="▼",
+            relief="flat",
+            bg=self.palette.get("panel", "#1e1e1e"),
+            fg=self.palette.get("muted", "#888888"),
+            font=self.font_small,
+            width=3,
+            cursor="hand2",
+            command=self._toggle_status_terminal,
+        )
+        self._status_collapse_btn.pack(side="right", padx=2)
+        
+        # Auto-scroll toggle
+        self._autoscroll_btn = tk.Button(
+            header,
+            text="Auto ✓",
+            relief="flat",
+            bg=self.palette.get("panel", "#1e1e1e"),
+            fg=self.palette.get("success", "#22c55e"),
+            font=self.font_small,
+            padx=6,
+            cursor="hand2",
+            command=self._toggle_autoscroll,
+        )
+        self._autoscroll_btn.pack(side="right", padx=2)
+        
+        # Clear button
+        clear_btn = tk.Button(
+            header,
+            text="Clear",
+            relief="flat",
+            bg=self.palette.get("panel", "#1e1e1e"),
+            fg=self.palette.get("muted", "#888888"),
+            font=self.font_small,
+            padx=6,
+            cursor="hand2",
+            command=self._clear_status_terminal,
+        )
+        clear_btn.pack(side="right", padx=2)
+        
+        # Size indicator label
+        self._size_label = tk.Label(
+            header,
+            text=f"{self._status_terminal_height}px",
+            font=self.font_small,
+            bg=self.palette.get("panel", "#1e1e1e"),
+            fg=self.palette.get("muted", "#666666"),
+        )
+        self._size_label.pack(side="right", padx=(0, 8))
+        
+        # Body frame (collapsible, resizable)
+        self._status_body_frame = tk.Frame(
+            self._status_terminal_frame,
+            bg=self.palette.get("bg", "#121212"),
+            height=self._status_terminal_height,
+        )
+        self._status_body_frame.pack(side="top", fill="x", padx=8, pady=(4, 8))
+        self._status_body_frame.pack_propagate(False)
+        
+        # Text widget (read-only, monospace)
+        self._status_text = tk.Text(
+            self._status_body_frame,
+            wrap="none",
+            font=self.font_mono,
+            bg=self.palette.get("bg", "#121212"),
+            fg=self.palette.get("text", "#ffffff"),
+            insertbackground=self.palette.get("text", "#ffffff"),
+            selectbackground=self.palette.get("accent", "#3b82f6"),
+            relief="flat",
+            padx=8,
+            pady=4,
+            state="disabled",
+            cursor="arrow",
+        )
+        self._status_text.pack(side="left", fill="both", expand=True)
+        
+        # Scrollbar
+        scrollbar = tk.Scrollbar(
+            self._status_body_frame,
+            command=self._status_text.yview,
+            bg=self.palette.get("panel", "#1e1e1e"),
+        )
+        scrollbar.pack(side="right", fill="y")
+        self._status_text.config(yscrollcommand=scrollbar.set)
+        
+        # Configure text tags for colors
+        self._status_text.tag_config("INFO", foreground=self.palette.get("text", "#ffffff"))
+        self._status_text.tag_config("OK", foreground=self.palette.get("success", "#22c55e"))
+        self._status_text.tag_config("WARN", foreground="#f59e0b")
+        self._status_text.tag_config("ERROR", foreground=self.palette.get("danger", "#ef4444"))
+        self._status_text.tag_config("TIMESTAMP", foreground=self.palette.get("muted", "#888888"))
+        
+        # Hidden state show bar (appears when terminal is hidden)
+        self._show_terminal_bar = tk.Frame(self.root, bg=self.palette.get("panel", "#1e1e1e"))
+        # Don't pack initially - only shown when terminal is hidden
+        
+        self._show_terminal_btn = tk.Button(
+            self._show_terminal_bar,
+            text="▲ Show Process Monitor",
+            relief="flat",
+            bg=self.palette.get("accent", "#3b82f6"),
+            fg="white",
+            font=self.font_small,
+            padx=16,
+            pady=4,
+            cursor="hand2",
+            command=self._show_status_terminal,
+        )
+        self._show_terminal_btn.pack(side="left", padx=8, pady=4)
+        
+        # Add a status indicator to the show bar
+        self._hidden_status_label = tk.Label(
+            self._show_terminal_bar,
+            text="Terminal hidden",
+            font=self.font_small,
+            bg=self.palette.get("panel", "#1e1e1e"),
+            fg=self.palette.get("muted", "#888888"),
+        )
+        self._hidden_status_label.pack(side="left", padx=8)
+    
+    def _toggle_status_terminal(self):
+        """Toggle collapse/expand of status terminal body."""
+        if self._status_terminal_collapsed:
+            self._status_body_frame.pack(side="top", fill="x", padx=8, pady=(4, 8))
+            self._status_collapse_btn.config(text="▼")
+            self._status_terminal_collapsed = False
+        else:
+            self._status_body_frame.pack_forget()
+            self._status_collapse_btn.config(text="▲")
+            self._status_terminal_collapsed = True
+    
+    def _toggle_autoscroll(self):
+        """Toggle auto-scroll behavior."""
+        self._status_terminal_autoscroll = not self._status_terminal_autoscroll
+        if self._status_terminal_autoscroll:
+            self._autoscroll_btn.config(text="Auto ✓", fg=self.palette.get("success", "#22c55e"))
+        else:
+            self._autoscroll_btn.config(text="Auto", fg=self.palette.get("muted", "#888888"))
+    
+    def _clear_status_terminal(self):
+        """Clear the status terminal text and session."""
+        self._status_text.config(state="normal")
+        self._status_text.delete("1.0", "end")
+        self._status_text.config(state="disabled")
+        get_bus().clear_session()
+    
+    def _toggle_pin_terminal(self):
+        """Toggle pin state - pinned terminal stays visible during page switches."""
+        self._status_terminal_pinned = not self._status_terminal_pinned
+        if self._status_terminal_pinned:
+            self._pin_btn.config(fg=self.palette.get("success", "#22c55e"))
+        else:
+            self._pin_btn.config(fg=self.palette.get("muted", "#888888"))
+    
+    def _hide_status_terminal(self):
+        """Hide the status terminal (minimize to show bar)."""
+        self._status_terminal_hidden = True
+        self._status_terminal_frame.pack_forget()
+        self._show_terminal_bar.pack(side="bottom", fill="x")
+    
+    def _show_status_terminal(self):
+        """Show the status terminal (restore from hidden)."""
+        self._status_terminal_hidden = False
+        self._show_terminal_bar.pack_forget()
+        self._status_terminal_frame.pack(side="bottom", fill="x")
+    
+    def _start_resize(self, event):
+        """Start resizing the terminal."""
+        self._resize_dragging = True
+        self._resize_start_y = event.y_root
+        self._resize_start_height = self._status_terminal_height
+    
+    def _do_resize(self, event):
+        """Handle resize drag - adjust terminal height."""
+        if not self._resize_dragging:
+            return
+        
+        # Calculate new height (dragging up increases height)
+        delta = self._resize_start_y - event.y_root
+        new_height = self._resize_start_height + delta
+        
+        # Clamp to min/max
+        new_height = max(self._status_terminal_min_height, min(self._status_terminal_max_height, new_height))
+        
+        # Apply new height
+        self._status_terminal_height = new_height
+        self._status_body_frame.config(height=new_height)
+        self._size_label.config(text=f"{new_height}px")
+    
+    def _stop_resize(self, event):
+        """Stop resizing the terminal."""
+        self._resize_dragging = False
+    
+    def _start_status_poller(self):
+        """Start the status bus poller using root.after()."""
+        self._poll_status_bus()
+    
+    def _poll_status_bus(self):
+        """Drain StatusBus queue and append formatted lines to terminal. Thread-safe."""
+        try:
+            events = get_bus().drain()
+            for event in events:
+                self._append_status_line(event)
+        except Exception:
+            pass
+        # Re-schedule (100ms interval)
+        self.root.after(100, self._poll_status_bus)
+    
+    def _append_status_line(self, event):
+        """Append a formatted status line to the terminal with professional formatting."""
+        self._status_text.config(state="normal")
+        
+        # Determine visual indicator based on level
+        if event.level == "OK":
+            icon = "✓"
+            level_display = "[OK]  "
+        elif event.level == "ERROR":
+            icon = "✗"
+            level_display = "[FAIL]"
+        elif event.level == "WARN":
+            icon = "!"
+            level_display = "[WARN]"
+        else:
+            icon = "→"
+            level_display = "[INFO]"
+        
+        # Format: [HH:MM:SS] [ICON] [LEVEL] Operation (Step): message
+        timestamp_str = f"[{event.timestamp}]"
+        
+        if event.step:
+            line = f"{timestamp_str} {icon} {level_display} {event.operation} | {event.step}: {event.message}\n"
+        else:
+            line = f"{timestamp_str} {icon} {level_display} {event.operation}: {event.message}\n"
+        
+        # Insert with tag for coloring
+        start_idx = self._status_text.index("end-1c")
+        self._status_text.insert("end", line)
+        
+        # Apply color tag to the line
+        end_idx = self._status_text.index("end-1c")
+        self._status_text.tag_add(event.level, start_idx, end_idx)
+        
+        # Trim if too many lines
+        line_count = int(self._status_text.index("end-1c").split(".")[0])
+        if line_count > self._status_terminal_max_lines:
+            excess = line_count - self._status_terminal_max_lines
+            self._status_text.delete("1.0", f"{excess + 1}.0")
+        
+        self._status_text.config(state="disabled")
+        
+        # Auto-scroll if enabled
+        if self._status_terminal_autoscroll:
+            self._status_text.see("end")
+    
+    def _show_process_viewer(self):
+        """Open pop-out Process Viewer window with full session transcript."""
+        viewer = tk.Toplevel(self.root)
+        viewer.title("Process Viewer - Session Transcript")
+        viewer.configure(bg=self.palette.get("bg", "#121212"))
+        viewer.geometry("900x600")
+        viewer.minsize(700, 400)
+        
+        # Header frame
+        header = tk.Frame(viewer, bg=self.palette.get("panel", "#1e1e1e"))
+        header.pack(side="top", fill="x", padx=0, pady=0)
+        
+        title_lbl = tk.Label(
+            header,
+            text="Session Transcript",
+            font=self.font_brand,
+            bg=self.palette.get("panel", "#1e1e1e"),
+            fg=self.palette.get("text", "#ffffff"),
+        )
+        title_lbl.pack(side="left", padx=16, pady=12)
+        
+        # Close button
+        close_btn = tk.Button(
+            header,
+            text="Close",
+            relief="flat",
+            bg=self.palette.get("danger", "#ef4444"),
+            fg="white",
+            font=self.font_small,
+            padx=12,
+            pady=4,
+            cursor="hand2",
+            command=viewer.destroy,
+        )
+        close_btn.pack(side="right", padx=8, pady=8)
+        
+        # Clear Session button
+        def _clear_and_refresh():
+            get_bus().clear_session()
+            self._clear_status_terminal()
+            _refresh_text()
+        
+        clear_btn = tk.Button(
+            header,
+            text="Clear Session",
+            relief="flat",
+            bg=self.palette.get("panel", "#1e1e1e"),
+            fg=self.palette.get("muted", "#888888"),
+            font=self.font_small,
+            padx=8,
+            pady=4,
+            cursor="hand2",
+            command=_clear_and_refresh,
+        )
+        clear_btn.pack(side="right", padx=4, pady=8)
+        
+        # Copy to Clipboard button
+        def _copy_transcript():
+            session = get_bus().get_current_session()
+            
+            # Generate professional text-based report for clipboard
+            lines = []
+            lines.append("=" * 80)
+            lines.append("                         REAL-TIME PROCESS LOG")
+            lines.append("=" * 80)
+            lines.append("")
+            
+            # Group events by operation
+            operations = {}
+            for event in session:
+                op_key = event.operation
+                if op_key not in operations:
+                    operations[op_key] = []
+                operations[op_key].append(event)
+            
+            step_num = 0
+            for op_name, events in operations.items():
+                step_num += 1
+                lines.append(f"Step {step_num}: {op_name}")
+                lines.append("-" * 60)
+                
+                for event in events:
+                    if event.level == "OK":
+                        icon = "[OK]   "
+                    elif event.level == "ERROR":
+                        icon = "[FAIL] "
+                    elif event.level == "WARN":
+                        icon = "[WARN] "
+                    else:
+                        icon = "[INFO] "
+                    
+                    if event.step:
+                        lines.append(f"  {icon}{event.step}: {event.message}")
+                    else:
+                        lines.append(f"  {icon}{event.message}")
+                
+                # Final status
+                final_event = events[-1]
+                if final_event.level == "OK":
+                    lines.append("  Status: COMPLETED SUCCESSFULLY")
+                elif final_event.level == "ERROR":
+                    lines.append("  Status: FAILED")
+                lines.append("")
+            
+            # Footer
+            from datetime import datetime
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            lines.append("-" * 80)
+            lines.append(f"Generated: {now}")
+            lines.append(f"Total Operations: {len(operations)}")
+            lines.append(f"Total Events: {len(session)}")
+            
+            transcript = "\n".join(lines)
+            self.root.clipboard_clear()
+            self.root.clipboard_append(transcript)
+            copy_btn.config(text="Copied!")
+            viewer.after(1500, lambda: copy_btn.config(text="Copy Transcript"))
+        
+        copy_btn = tk.Button(
+            header,
+            text="Copy Transcript",
+            relief="flat",
+            bg=self.palette.get("accent", "#3b82f6"),
+            fg=self.palette.get("accent_fg", "white"),
+            font=self.font_small,
+            padx=8,
+            pady=4,
+            cursor="hand2",
+            command=_copy_transcript,
+        )
+        copy_btn.pack(side="right", padx=4, pady=8)
+        
+        # Export Report button
+        def _export_report():
+            from tkinter import filedialog
+            from datetime import datetime
+            
+            session = get_bus().get_current_session()
+            if not session:
+                return
+            
+            # Generate professional text-based report
+            lines = []
+            lines.append("=" * 80)
+            lines.append("                    SECURECRYPT VAULT - PROCESS REPORT")
+            lines.append("=" * 80)
+            lines.append("")
+            
+            # Group events by operation
+            operations = {}
+            for event in session:
+                op_key = event.operation
+                if op_key not in operations:
+                    operations[op_key] = []
+                operations[op_key].append(event)
+            
+            step_num = 0
+            for op_name, events in operations.items():
+                step_num += 1
+                lines.append(f"STEP {step_num}: {op_name.upper()}")
+                lines.append("-" * 70)
+                
+                for event in events:
+                    if event.level == "OK":
+                        icon = "[OK]   "
+                    elif event.level == "ERROR":
+                        icon = "[FAIL] "
+                    elif event.level == "WARN":
+                        icon = "[WARN] "
+                    else:
+                        icon = "[INFO] "
+                    
+                    if event.step:
+                        lines.append(f"    {icon}{event.step}: {event.message}")
+                    else:
+                        lines.append(f"    {icon}{event.message}")
+                
+                # Final status
+                final_event = events[-1]
+                if final_event.level == "OK":
+                    lines.append("")
+                    lines.append("    >>> Status: COMPLETED SUCCESSFULLY")
+                elif final_event.level == "ERROR":
+                    lines.append("")
+                    lines.append("    >>> Status: FAILED")
+                lines.append("")
+            
+            # Footer
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            lines.append("=" * 80)
+            lines.append(f"Report Generated: {now}")
+            lines.append(f"Total Operations: {len(operations)}")
+            lines.append(f"Total Events: {len(session)}")
+            lines.append("=" * 80)
+            
+            report_content = "\n".join(lines)
+            
+            # Ask user where to save
+            filename = filedialog.asksaveasfilename(
+                title="Export Process Report",
+                defaultextension=".txt",
+                filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+                initialfile=f"process_report_{datetime.now().strftime('%Y%m%d_%H%M%S')}.txt"
+            )
+            
+            if filename:
+                with open(filename, "w", encoding="utf-8") as f:
+                    f.write(report_content)
+                export_btn.config(text="Exported!")
+                viewer.after(1500, lambda: export_btn.config(text="Export Report"))
+        
+        export_btn = tk.Button(
+            header,
+            text="Export Report",
+            relief="flat",
+            bg=self.palette.get("success", "#22c55e"),
+            fg="white",
+            font=self.font_small,
+            padx=8,
+            pady=4,
+            cursor="hand2",
+            command=_export_report,
+        )
+        export_btn.pack(side="right", padx=4, pady=8)
+        
+        # Text area
+        text_frame = tk.Frame(viewer, bg=self.palette.get("bg", "#121212"))
+        text_frame.pack(side="top", fill="both", expand=True, padx=16, pady=(8, 16))
+        
+        text_widget = tk.Text(
+            text_frame,
+            wrap="none",
+            font=self.font_mono,
+            bg=self.palette.get("bg", "#121212"),
+            fg=self.palette.get("text", "#ffffff"),
+            insertbackground=self.palette.get("text", "#ffffff"),
+            selectbackground=self.palette.get("accent", "#3b82f6"),
+            relief="flat",
+            padx=12,
+            pady=8,
+            state="disabled",
+        )
+        text_widget.pack(side="left", fill="both", expand=True)
+        
+        scrollbar = tk.Scrollbar(text_frame, command=text_widget.yview)
+        scrollbar.pack(side="right", fill="y")
+        text_widget.config(yscrollcommand=scrollbar.set)
+        
+        # Configure tags
+        text_widget.tag_config("INFO", foreground=self.palette.get("text", "#ffffff"))
+        text_widget.tag_config("OK", foreground=self.palette.get("success", "#22c55e"))
+        text_widget.tag_config("WARN", foreground="#f59e0b")
+        text_widget.tag_config("ERROR", foreground=self.palette.get("danger", "#ef4444"))
+        text_widget.tag_config("HEADER", foreground=self.palette.get("accent", "#3b82f6"), font=self.font_nav)
+        
+        # Additional tags for professional formatting
+        text_widget.tag_config("BORDER", foreground="#4ade80")
+        text_widget.tag_config("SECTION", foreground="#22d3ee", font=self.font_nav)
+        text_widget.tag_config("STEP", foreground="#60a5fa")
+        text_widget.tag_config("CHECK", foreground="#22c55e")
+        text_widget.tag_config("CROSS", foreground="#ef4444")
+        text_widget.tag_config("LABEL", foreground="#a1a1aa")
+        text_widget.tag_config("VALUE", foreground="#ffffff")
+        
+        def _format_professional_report(session):
+            """Format session events into professional report-grade output."""
+            lines = []
+            
+            # Group events by operation
+            operations = {}
+            for event in session:
+                op_key = event.operation
+                if op_key not in operations:
+                    operations[op_key] = []
+                operations[op_key].append(event)
+            
+            # Build report
+            lines.append(("╔" + "═" * 78 + "╗\n", "BORDER"))
+            lines.append(("║" + " " * 25 + "REAL-TIME PROCESS LOG" + " " * 32 + "║\n", "BORDER"))
+            lines.append(("╚" + "═" * 78 + "╝\n\n", "BORDER"))
+            
+            step_num = 0
+            for op_name, events in operations.items():
+                step_num += 1
+                
+                # Section header
+                lines.append((f"┌─ Step {step_num}: {op_name} ", "SECTION"))
+                lines.append(("─" * (60 - len(op_name)) + "┐\n", "SECTION"))
+                lines.append(("│\n", "BORDER"))
+                
+                for event in events:
+                    # Determine icon based on level
+                    if event.level == "OK":
+                        icon = "✓"
+                        icon_tag = "CHECK"
+                    elif event.level == "ERROR":
+                        icon = "✗"
+                        icon_tag = "CROSS"
+                    elif event.level == "WARN":
+                        icon = "!"
+                        icon_tag = "WARN"
+                    else:
+                        icon = "→"
+                        icon_tag = "INFO"
+                    
+                    # Format the line
+                    lines.append(("│  ", "BORDER"))
+                    lines.append((f"{icon} ", icon_tag))
+                    
+                    if event.step:
+                        lines.append((f"{event.step}: ", "LABEL"))
+                    
+                    lines.append((f"{event.message}", event.level))
+                    lines.append(("\n", "INFO"))
+                
+                lines.append(("│\n", "BORDER"))
+                
+                # Show final status for operation
+                final_event = events[-1]
+                if final_event.level == "OK":
+                    lines.append(("│  ", "BORDER"))
+                    lines.append(("Status: ", "LABEL"))
+                    lines.append(("COMPLETED SUCCESSFULLY\n", "CHECK"))
+                elif final_event.level == "ERROR":
+                    lines.append(("│  ", "BORDER"))
+                    lines.append(("Status: ", "LABEL"))
+                    lines.append(("FAILED\n", "CROSS"))
+                
+                lines.append(("└" + "─" * 78 + "┘\n\n", "SECTION"))
+            
+            # Footer with timestamp
+            from datetime import datetime
+            now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+            lines.append(("─" * 80 + "\n", "LABEL"))
+            lines.append(("Generated: ", "LABEL"))
+            lines.append((f"{now}\n", "VALUE"))
+            lines.append(("Total Operations: ", "LABEL"))
+            lines.append((f"{len(operations)}\n", "VALUE"))
+            lines.append(("Total Events: ", "LABEL"))
+            lines.append((f"{len(session)}\n", "VALUE"))
+            
+            return lines
+        
+        def _refresh_text():
+            text_widget.config(state="normal")
+            text_widget.delete("1.0", "end")
+            
+            session = get_bus().get_current_session()
+            if not session:
+                text_widget.insert("end", "No status events in current session.\n", "INFO")
+            else:
+                # Generate professional report
+                formatted_lines = _format_professional_report(session)
+                for text, tag in formatted_lines:
+                    text_widget.insert("end", text, tag)
+            
+            text_widget.config(state="disabled")
+        
+        _refresh_text()
+        
+        # Focus the viewer
+        viewer.focus_force()
+        viewer.grab_set()
 
     def _center_window(self, w: int, h: int, min_w=None, min_h=None):
         """Center window on screen with smart sizing."""
@@ -830,6 +1552,7 @@ class VaultTkApp:
         """Phase 6.2: User chose to lock the app; same path as idle lock. Backup timer continues in background."""
         if not self.session or self.session_security.is_locked():
             return
+        get_bus().info("Lock", "Locking session...")
         self._clear_idle_lock()
         self._locked_from_page = getattr(self, "active_nav_key", None) or "dashboard"
         try:
@@ -839,6 +1562,7 @@ class VaultTkApp:
             pass
         self.session_security.lock_session("manual")
         self.logger.info("Session locked (manual)")
+        get_bus().ok("Lock", "Session locked")
         self._transition_to_locked_ui(reason="manual")
 
     def _clear_unfocused_lock(self):
@@ -1048,6 +1772,9 @@ class VaultTkApp:
 
     def _unlock(self):
         """Validate passphrase, re-derive keys, unlock session, return to main view."""
+        bus = get_bus()
+        bus.info("Unlock", "Verifying passphrase...")
+        
         if getattr(self, "unlock_btn", None):
             try:
                 self.unlock_btn.config(state="disabled")
@@ -1055,6 +1782,7 @@ class VaultTkApp:
                 pass
         passphrase = (self.unlock_pass.get() or "").strip()
         if not passphrase:
+            bus.error("Unlock", "Missing passphrase")
             self._show_toast("Enter your login password.", "warning")
             if getattr(self, "unlock_btn", None):
                 try:
@@ -1169,6 +1897,7 @@ class VaultTkApp:
         self.session_security.unlock_session()
         self._clear_idle_lock()
         self._arm_idle_lock()
+        bus.ok("Unlock", "Session resumed")
         ok_ext, _ = self.extension_server.start()
         self._build_main_view()
         self.show_page(getattr(self, "_locked_from_page", "dashboard"))
@@ -1437,6 +2166,9 @@ class VaultTkApp:
         self.root.update_idletasks()
         self.root.clipboard_append(value)
         self._set_status(f"{label} copied to clipboard")
+        
+        # Status terminal update (never show the value itself)
+        get_bus().ok("Clipboard", f"{label} copied to clipboard")
 
         # Auto-clear clipboard after configured timeout (only when enabled)
         if getattr(self, "clipboard_clear_enabled", True):
@@ -2668,6 +3400,9 @@ class VaultTkApp:
         clear_and_close()
 
     def _register(self):
+        bus = get_bus()
+        bus.info("Register", "Validating registration data...")
+        
         username = self.reg_username.get().strip()
         email = self.reg_email.get().strip()
         login_pass = self.reg_login_pass.get()
@@ -2675,46 +3410,60 @@ class VaultTkApp:
 
         ok_lp, msg_lp = self.api.validate_passphrase(login_pass)
         if not ok_lp:
+            bus.error("Register", "Passphrase validation failed")
             return messagebox.showerror("Validation", f"Login passphrase: {msg_lp}")
         ok_rp, msg_rp = self.api.validate_passphrase(recovery_pass)
         if not ok_rp:
+            bus.error("Register", "Recovery passphrase validation failed")
             return messagebox.showerror("Validation", f"Recovery passphrase: {msg_rp}")
         if login_pass == recovery_pass:
+            bus.error("Register", "Passphrase validation failed")
             return messagebox.showerror("Validation", "Recovery passphrase must be different.")
 
         ok_u, msg_u = CryptoUtils.validate_input(username, "username")
         if not ok_u:
+            bus.error("Register", "Username validation failed")
             return messagebox.showerror("Validation", msg_u)
 
         ok_e, msg_e = CryptoUtils.validate_input(email, "email")
         if not ok_e:
+            bus.error("Register", "Email validation failed")
             return messagebox.showerror("Validation", msg_e)
 
         try:
+            bus.info("Register", "Generating RSA key pairs...", step="Key Gen")
             api_bundle = {}
             for purpose in ["auth", "signing", "encryption"]:
                 priv = CryptoUtils.generate_rsa_key_pair(3072)
                 priv_pem = CryptoUtils.serialize_private_key(priv)
                 pub_pem = CryptoUtils.serialize_public_key(priv.public_key()).decode()
 
+                bus.info("Register", f"Protecting {purpose} key...", step="Key Protect")
                 protected = LocalKeyManager.protect_key_bundle(priv_pem, login_pass, recovery_pass)
                 self._secure_write_json(self._safe_key_path(username, purpose), protected)
                 api_bundle[purpose] = {"pub_pem": pub_pem}
 
+            bus.info("Register", "Creating user account...", step="API Call")
             ok, msg = self.api.register_user(username, email, api_bundle)
             if ok:
                 self.reg_username.set("")
                 self.reg_email.set("")
                 self.reg_login_pass.set("")
                 self.reg_recovery_pass.set("")
+                bus.ok("Register", "Registration complete")
                 messagebox.showinfo("Success", msg)
                 self._set_status("Account created successfully")
             else:
+                bus.error("Register", "Registration failed")
                 messagebox.showerror("Registration failed", msg)
         except Exception as e:
+            bus.error("Register", "Registration failed")
             messagebox.showerror("Registration failed", str(e))
 
     def _login(self):
+        bus = get_bus()
+        bus.info("Login", "Validating credentials...")
+        
         def _reenable_login_btn():
             if getattr(self, "login_btn", None):
                 try:
@@ -2733,10 +3482,12 @@ class VaultTkApp:
 
         ok_u, msg_u = CryptoUtils.validate_input(username, "username")
         if not ok_u:
+            bus.error("Login", "Validation failed")
             _reenable_login_btn()
             return messagebox.showerror("Validation", msg_u)
 
         if not passphrase:
+            bus.error("Login", "Missing passphrase")
             _reenable_login_btn()
             return messagebox.showerror("Validation", "Enter your login passphrase.")
 
@@ -2761,28 +3512,34 @@ class VaultTkApp:
             enc_path = self._safe_key_path(username, "encryption")
             sign_path = self._safe_key_path(username, "signing")
         except Exception as e:
+            bus.error("Login", "Key path error")
             _reenable_login_btn()
             return messagebox.showerror("Login", str(e))
 
         if not auth_path.exists():
+            bus.error("Login", "Identity not found on this device")
             _reenable_login_btn()
             return messagebox.showerror("Login", "Identity not found on this device.")
 
         try:
+            bus.info("Login", "Deriving encryption key...", step="Key Derive")
             auth_bundle = json.loads(auth_path.read_text(encoding="utf-8"))
             auth_priv = LocalKeyManager.unlock_key_from_bundle(auth_bundle, passphrase)
             if not auth_priv:
+                bus.error("Login", "Invalid passphrase")
                 self.api.record_unlock_failure(username)
                 self.login_pass.set("")
                 _reenable_login_btn()
                 return messagebox.showerror("Login", "Invalid passphrase.")
 
+            bus.info("Login", "Authenticating with server...", step="Auth")
             ok, user, _, msg = self.api.login_user(
                 username,
                 priv_key_data=auth_priv,
                 client_fingerprint="tk-desktop",
             )
             if not ok:
+                bus.error("Login", "Authentication failed")
                 self.login_pass.set("")
                 _reenable_login_btn()
                 return messagebox.showerror("Login failed", msg)
@@ -2811,6 +3568,7 @@ class VaultTkApp:
 
             self.login_pass.set("")
 
+            bus.info("Login", "Creating session...", step="Session")
             self.current_user = dict(user)
             self.session = {
                 "user_id": int(user["id"]),
@@ -2824,6 +3582,7 @@ class VaultTkApp:
             self._arm_idle_lock()
             ok_ext, msg_ext = self.extension_server.start()
 
+            bus.ok("Login", "Login successful")
             self._build_main_view()
 
             try:
