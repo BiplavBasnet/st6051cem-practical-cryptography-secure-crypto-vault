@@ -35,3 +35,9 @@ htmlcov/
 # OS
 .DS_Store
 Thumbs.db
+
+# Sensitive files
+secret.bin
+agreement.txt
+*.key
+*.pem
