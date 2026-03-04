@@ -3832,7 +3832,7 @@ class VaultTkApp:
         )
 
     def _maybe_prompt_backup_credentials(self):
-        """Show popup asking for backup credentials if auto backup is enabled but cache may be empty."""
+        """Show popup asking for backup credentials if auto backup is enabled but cache is empty."""
         self._backup_cred_prompt_job = None
         if not self.session or self.session_security.is_locked():
             return
@@ -3842,6 +3842,9 @@ class VaultTkApp:
             if not status.get("enabled"):
                 return
             if not status.get("backup_on_change_enabled") and not status.get("backup_auto_enabled"):
+                return
+            # Don't prompt if credentials are already cached for this session
+            if status.get("credentials_cached_for_session"):
                 return
         except Exception:
             return
