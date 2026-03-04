@@ -314,11 +314,45 @@ class VaultAPI:
     def get_near_duplicates(self, user_id):
         return self.secret_service.get_near_duplicates(user_id)
 
+    def repair_corrupted_entry(self, user_id: int, entry_id: int, cert_pem: bytes):
+        """
+        Attempt to repair a corrupted vault entry by re-encrypting plaintext.
+        Returns (success, message, recovered_password_or_none).
+        """
+        return self.secret_service.repair_corrupted_entry(user_id, entry_id, cert_pem)
+
+    def get_raw_secret_data(self, user_id: int, entry_id: int):
+        """Get raw entry data for diagnostics."""
+        return self.secret_service.get_raw_secret_data(user_id, entry_id)
+
     def export_secrets_as_csv(self, user_id, priv_key_data):
         return self.secret_service.export_secrets_as_csv(user_id, priv_key_data)
-    
+
     def export_secrets_as_json(self, user_id, priv_key_data):
         return self.secret_service.export_secrets_as_json(user_id, priv_key_data)
+
+    def export_signed_secrets(self, fmt: str, user_id: int, priv_key_data: bytes, signing_priv_key_data: bytes):
+        """
+        Export vault secrets in the given format AND return a detached signature bundle.
+
+        fmt: "csv" or "json"
+        Returns (ok, message, payload_str, signature_bundle_dict)
+        """
+        fmt_lc = (fmt or "").strip().lower()
+        if fmt_lc == "csv":
+            return self.secret_service.export_signed_secrets_as_csv(user_id, priv_key_data, signing_priv_key_data)
+        elif fmt_lc == "json":
+            return self.secret_service.export_signed_secrets_as_json(user_id, priv_key_data, signing_priv_key_data)
+        else:
+            return False, f"Unsupported export format: {fmt}", "", None
+
+    def verify_vault_export(self, payload_bytes: bytes, bundle: dict):
+        """
+        Verify a vault export file against its signature bundle.
+
+        Returns (ok, result_dict) where result_dict contains status/reason/details.
+        """
+        return self.secret_service.verify_export_signature(payload_bytes, bundle)
 
     def export_vault_backup(self, user_id, priv_key_data, backup_passphrase):
         return self.secret_service.export_encrypted_backup(user_id, priv_key_data, backup_passphrase)
@@ -378,9 +412,9 @@ class VaultAPI:
     def set_backup_password(self, user_id, password):
         return self.backup_service.set_backup_password(user_id, password)
 
-    def export_user_backup_encrypted(self, user_id, priv_key_data, destination_path_or_bytes, recovery_key_or_password, mode="recovery_key"):
+    def export_user_backup_encrypted(self, user_id, priv_key_data, destination_path_or_bytes, recovery_key_or_password, mode="recovery_key", cert_pem=None):
         return self.backup_service.export_user_backup_encrypted(
-            user_id, priv_key_data, destination_path_or_bytes, recovery_key_or_password, mode
+            user_id, priv_key_data, destination_path_or_bytes, recovery_key_or_password, mode, cert_pem=cert_pem
         )
 
     def decrypt_backup_package(self, backup_bytes_or_path, recovery_key_or_password, mode="recovery_key"):
@@ -419,10 +453,10 @@ class VaultAPI:
     def clear_auto_backup_key_for_user(self, user_id):
         return self.backup_service.clear_auto_backup_key_for_user(user_id)
 
-    def create_local_backup_now(self, user_id, priv_key_data, reason="manual", recovery_key_or_password=None, mode=None):
+    def create_local_backup_now(self, user_id, priv_key_data, reason="manual", recovery_key_or_password=None, mode=None, cert_pem=None):
         return self.backup_service.create_local_backup_now(
             user_id, priv_key_data, reason=reason,
-            recovery_key_or_password=recovery_key_or_password, mode=mode,
+            recovery_key_or_password=recovery_key_or_password, mode=mode, cert_pem=cert_pem,
         )
 
     def prune_local_backups(self, user_id):

@@ -1334,9 +1334,8 @@ class VaultTkApp:
         
         _refresh_text()
         
-        # Focus the viewer
+        # Focus the viewer (no grab_set so user can work with main app)
         viewer.focus_force()
-        viewer.grab_set()
 
     def _center_window(self, w: int, h: int, min_w=None, min_h=None):
         """Center window on screen with smart sizing."""
@@ -1904,6 +1903,7 @@ class VaultTkApp:
         self.root.update_idletasks()  # Ensure content is painted after unlock
         self._schedule_backup_tick()
         self._schedule_hard_expiry_check()  # Phase 6.4
+        self._schedule_backup_cred_prompt()  # Prompt for backup credentials after unlock
         self._set_status(f"Unlocked. Logged in as {username}" + (" · Extension API running" if ok_ext else ""))
         self._show_toast("Unlocked successfully.", "success")
 
@@ -3603,6 +3603,9 @@ class VaultTkApp:
                 self._set_status(f"Logged in as {username} · Extension API running on http://127.0.0.1:5005")
             else:
                 self._set_status(f"Logged in as {username} · Extension API error: {msg_ext}")
+
+            # Schedule backup credentials prompt after 30s
+            self._schedule_backup_cred_prompt()
         except Exception as e:
             try:
                 self.login_pass.set("")
@@ -3846,9 +3849,11 @@ class VaultTkApp:
         dialog = tk.Toplevel(self.root)
         dialog.title("Auto backup needs credentials")
         dialog.transient(self.root)
-        dialog.grab_set()
         dialog.configure(bg=self.palette["bg"])
-        dialog.minsize(420, 200)
+        dialog.minsize(420, 220)
+        dialog.lift()
+        dialog.focus_set()
+        dialog.protocol("WM_DELETE_WINDOW", dialog.destroy)
         f = ttk.Frame(dialog, style="AuthCard.TFrame", padding=24)
         f.pack(fill="both", expand=True)
         f.columnconfigure(0, weight=1)
@@ -4083,6 +4088,34 @@ class VaultTkApp:
 
         ttk.Button(sec_card, text="Save", command=self._save_settings).pack(anchor="w")
 
+        # Account Security Section - Key Rotation & Certificate Management
+        acct_sec_card = ttk.Frame(page, style="Soft.TFrame", padding=16)
+        acct_sec_card.pack(fill="x", pady=10)
+        ttk.Label(acct_sec_card, text="Account Security", style="CardTitle.TLabel", background=self.palette["card_soft"]).pack(anchor="w", pady=(0, 6))
+        ttk.Label(
+            acct_sec_card,
+            text="Manage your cryptographic keys and certificates. Rotating keys generates new credentials and revokes old ones.",
+            style="Sub.TLabel",
+            background=self.palette["card_soft"],
+            wraplength=520,
+        ).pack(anchor="w", pady=(0, 10))
+
+        acct_btn_row = ttk.Frame(acct_sec_card, style="Soft.TFrame")
+        acct_btn_row.pack(anchor="w", fill="x")
+
+        ttk.Button(
+            acct_btn_row,
+            text="Rotate Keys",
+            command=self._open_rotate_keys_dialog,
+            style="Accent.TButton",
+        ).pack(side="left", padx=(0, 10))
+
+        ttk.Button(
+            acct_btn_row,
+            text="Manage Certificates",
+            command=self._open_manage_certificates_popup,
+        ).pack(side="left")
+
         # So mouse wheel scrolls when hovering anywhere over Settings content, not just the scrollbar
         _bind_mousewheel_to_children(inner)
 
@@ -4173,6 +4206,418 @@ class VaultTkApp:
         except Exception as e:
             self.logger.error("Error saving settings: %s", e, exc_info=True)
             messagebox.showerror("Error", f"Failed to save settings: {str(e)}")
+
+    # ── Account Security: Key Rotation & Certificate Management ────────────────
+
+    def _open_manage_certificates_popup(self):
+        """Open popup showing all user certificates with Rotate action."""
+        if not self.session:
+            return messagebox.showwarning("Certificates", "Please log in first.")
+
+        popup = tk.Toplevel(self.root)
+        popup.title("Manage Certificates")
+        popup.configure(bg=self.palette.get("bg", "#121212"))
+        popup.geometry("800x550")
+        popup.minsize(700, 450)
+        popup.lift()
+        popup.focus_set()
+
+        # Ensure window can be closed with X button
+        popup.protocol("WM_DELETE_WINDOW", popup.destroy)
+
+        main = tk.Frame(popup, bg=self.palette.get("bg", "#121212"), padx=24, pady=20)
+        main.pack(fill="both", expand=True)
+
+        # Header
+        tk.Label(
+            main,
+            text="Manage Certificates",
+            font=self.font_title,
+            bg=self.palette.get("bg", "#121212"),
+            fg=self.palette.get("text", "#ffffff"),
+        ).pack(anchor="w", pady=(0, 4))
+        tk.Label(
+            main,
+            text="View your certificates. To revoke a certificate, use 'Rotate Keys' which safely generates new credentials.",
+            font=self.font_small,
+            bg=self.palette.get("bg", "#121212"),
+            fg=self.palette.get("text_muted", "#888888"),
+            wraplength=650,
+        ).pack(anchor="w", pady=(0, 12))
+
+        # Certificate table using Treeview
+        columns = ("type", "serial", "expires", "status")
+        tree_frame = tk.Frame(main, bg=self.palette.get("bg", "#121212"))
+        tree_frame.pack(fill="both", expand=True, pady=(0, 10))
+
+        tree = ttk.Treeview(tree_frame, columns=columns, show="headings", height=10)
+        tree.heading("type", text="Type")
+        tree.heading("serial", text="Serial")
+        tree.heading("expires", text="Expires")
+        tree.heading("status", text="Status")
+
+        tree.column("type", width=100, anchor="w")
+        tree.column("serial", width=180, anchor="w")
+        tree.column("expires", width=150, anchor="w")
+        tree.column("status", width=100, anchor="center")
+
+        scrollbar = ttk.Scrollbar(tree_frame, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=scrollbar.set)
+
+        tree.pack(side="left", fill="both", expand=True)
+        scrollbar.pack(side="right", fill="y")
+
+        # Load certificates
+        try:
+            certs = self.api.get_user_certificates(int(self.session["user_id"]))
+            for cert in certs:
+                cert_type = cert.get("key_usage", "unknown").capitalize()
+                serial = cert.get("serial_number", "N/A")
+                if len(serial) > 20:
+                    serial = serial[:8] + "..." + serial[-8:]
+                valid_to = cert.get("valid_to", "N/A")
+                if hasattr(valid_to, "strftime"):
+                    valid_to = valid_to.strftime("%Y-%m-%d")
+                elif isinstance(valid_to, str) and len(valid_to) > 10:
+                    valid_to = valid_to[:10]
+                revoked = cert.get("revoked", 0)
+                status = "Revoked" if revoked else "Active"
+                tag = "revoked" if revoked else "active"
+                tree.insert("", "end", values=(cert_type, serial, valid_to, status), tags=(tag,))
+
+            tree.tag_configure("active", foreground=self.palette.get("success", "#22c55e"))
+            tree.tag_configure("revoked", foreground=self.palette.get("error", "#ef4444"))
+        except Exception as e:
+            self.logger.error("Failed to load certificates: %s", e)
+            tk.Label(
+                main,
+                text=f"Error loading certificates: {e}",
+                font=self.font_small,
+                bg=self.palette.get("bg", "#121212"),
+                fg=self.palette.get("error", "#ef4444"),
+            ).pack(anchor="w")
+
+        # Info notice
+        notice_frame = tk.Frame(main, bg=self.palette.get("card_soft", "#1e1e1e"), padx=10, pady=8)
+        notice_frame.pack(fill="x", pady=(0, 10))
+        tk.Label(
+            notice_frame,
+            text="ℹ️ Certificates are revoked automatically when you rotate keys. This ensures you always have valid credentials.",
+            font=self.font_small,
+            bg=self.palette.get("card_soft", "#1e1e1e"),
+            fg=self.palette.get("text_muted", "#888888"),
+            wraplength=620,
+            justify="left",
+        ).pack(anchor="w")
+
+        # Buttons
+        btn_frame = tk.Frame(main, bg=self.palette.get("bg", "#121212"))
+        btn_frame.pack(fill="x")
+
+        def _rotate_and_close():
+            popup.destroy()
+            self._open_rotate_keys_dialog()
+
+        tk.Button(
+            btn_frame,
+            text="Rotate All Keys",
+            relief="flat",
+            bg=self.palette.get("accent", "#3b82f6"),
+            fg="white",
+            font=self.font_button,
+            padx=16,
+            pady=8,
+            command=_rotate_and_close,
+        ).pack(side="left", padx=(0, 10))
+
+        tk.Button(
+            btn_frame,
+            text="Close",
+            relief="flat",
+            bg=self.palette.get("card", "#2d2d2d"),
+            fg=self.palette.get("text", "#ffffff"),
+            font=self.font_button,
+            padx=16,
+            pady=8,
+            command=popup.destroy,
+        ).pack(side="left")
+
+    def _open_rotate_keys_dialog(self):
+        """Open dialog to confirm key rotation with passphrase entry."""
+        if not self.session:
+            return messagebox.showwarning("Rotate Keys", "Please log in first.")
+
+        popup = tk.Toplevel(self.root)
+        popup.title("Rotate Keys")
+        popup.configure(bg=self.palette.get("bg", "#121212"))
+        popup.geometry("550x520")
+        popup.minsize(500, 480)
+        popup.lift()
+        popup.focus_set()
+        popup.transient(self.root)
+
+        # Ensure window can be closed with X button
+        popup.protocol("WM_DELETE_WINDOW", popup.destroy)
+
+        main = tk.Frame(popup, bg=self.palette.get("bg", "#121212"), padx=28, pady=24)
+        main.pack(fill="both", expand=True)
+
+        # Header
+        tk.Label(
+            main,
+            text="Rotate Keys",
+            font=self.font_title,
+            bg=self.palette.get("bg", "#121212"),
+            fg=self.palette.get("text", "#ffffff"),
+        ).pack(anchor="w", pady=(0, 12))
+
+        # Explanation
+        info_frame = tk.Frame(main, bg=self.palette.get("card_soft", "#1e1e1e"), padx=16, pady=14)
+        info_frame.pack(fill="x", pady=(0, 20))
+
+        tk.Label(
+            info_frame,
+            text="This will:",
+            font=self.font_button,
+            bg=self.palette.get("card_soft", "#1e1e1e"),
+            fg=self.palette.get("text", "#ffffff"),
+        ).pack(anchor="w")
+
+        for item in [
+            "✓ Generate new cryptographic keys",
+            "✓ Issue new certificates",
+            "✓ Automatically revoke current certificates",
+            "✓ Keep you logged in",
+        ]:
+            tk.Label(
+                info_frame,
+                text=item,
+                font=self.font_base,
+                bg=self.palette.get("card_soft", "#1e1e1e"),
+                fg=self.palette.get("success", "#22c55e"),
+            ).pack(anchor="w", pady=2)
+
+        tk.Label(
+            info_frame,
+            text="\nYour passphrase remains the same.",
+            font=self.font_small,
+            bg=self.palette.get("card_soft", "#1e1e1e"),
+            fg=self.palette.get("text_muted", "#888888"),
+        ).pack(anchor="w")
+
+        # Passphrase entry with show/hide
+        tk.Label(
+            main,
+            text="Enter your login passphrase to confirm:",
+            font=self.font_base,
+            bg=self.palette.get("bg", "#121212"),
+            fg=self.palette.get("text", "#ffffff"),
+        ).pack(anchor="w", pady=(12, 6))
+
+        passphrase_var = tk.StringVar()
+        pass_row = self._make_password_entry_with_eye(main, passphrase_var, mask="*")
+        pass_row.pack(fill="x", pady=(0, 12))
+
+        # Recovery passphrase (needed for new key bundle) with show/hide
+        tk.Label(
+            main,
+            text="Enter your recovery passphrase:",
+            font=self.font_base,
+            bg=self.palette.get("bg", "#121212"),
+            fg=self.palette.get("text", "#ffffff"),
+        ).pack(anchor="w", pady=(8, 6))
+
+        recovery_var = tk.StringVar()
+        rec_row = self._make_password_entry_with_eye(main, recovery_var, mask="*")
+        rec_row.pack(fill="x", pady=(0, 20))
+
+        # Status/error label
+        status_var = tk.StringVar()
+        status_label = tk.Label(
+            main,
+            textvariable=status_var,
+            font=self.font_small,
+            bg=self.palette.get("bg", "#121212"),
+            fg=self.palette.get("error", "#ef4444"),
+            wraplength=400,
+        )
+        status_label.pack(anchor="w", pady=(0, 8))
+
+        # Buttons
+        btn_frame = tk.Frame(main, bg=self.palette.get("bg", "#121212"))
+        btn_frame.pack(fill="x")
+
+        def _do_rotate():
+            login_pass = passphrase_var.get().strip()
+            recovery_pass = recovery_var.get().strip()
+
+            if not login_pass:
+                status_var.set("Please enter your login passphrase.")
+                return
+            if not recovery_pass:
+                status_var.set("Please enter your recovery passphrase.")
+                return
+
+            status_var.set("")
+            rotate_btn.config(state="disabled")
+            popup.update()
+
+            self._execute_key_rotation(popup, login_pass, recovery_pass, status_var, rotate_btn)
+
+        rotate_btn = tk.Button(
+            btn_frame,
+            text="Rotate Keys",
+            relief="flat",
+            bg=self.palette.get("accent", "#3b82f6"),
+            fg="white",
+            font=self.font_button,
+            padx=16,
+            pady=8,
+            command=_do_rotate,
+        )
+        rotate_btn.pack(side="left", padx=(0, 10))
+
+        def _cancel():
+            passphrase_var.set("")
+            recovery_var.set("")
+            popup.destroy()
+
+        tk.Button(
+            btn_frame,
+            text="Cancel",
+            relief="flat",
+            bg=self.palette.get("card", "#2d2d2d"),
+            fg=self.palette.get("text", "#ffffff"),
+            font=self.font_button,
+            padx=16,
+            pady=8,
+            command=_cancel,
+        ).pack(side="left")
+
+        pass_entry.focus_set()
+
+    def _execute_key_rotation(self, popup, login_pass, recovery_pass, status_var, rotate_btn):
+        """Execute the key rotation process."""
+        from services.status_bus import get_bus
+        bus = get_bus()
+
+        username = self.session.get("username")
+        if not username:
+            status_var.set("Session error: username not found.")
+            rotate_btn.config(state="normal")
+            return
+
+        bus.info("Key Rotation", f"Starting key rotation for user: {username}")
+
+        # Step 1: Verify passphrase by trying to unlock existing keys
+        bus.info("Key Rotation", "Verifying passphrase...")
+        try:
+            enc_path = self._safe_key_path(username, "encryption")
+            if not enc_path.exists():
+                bus.error("Key Rotation", "Encryption key file not found")
+                status_var.set("Key files not found. Cannot rotate keys.")
+                rotate_btn.config(state="normal")
+                return
+
+            enc_bundle = json.loads(enc_path.read_text(encoding="utf-8"))
+            test_unlock = LocalKeyManager.unlock_key_from_bundle(enc_bundle, login_pass)
+            if not test_unlock:
+                bus.error("Key Rotation", "Incorrect passphrase")
+                status_var.set("Incorrect login passphrase. Please try again.")
+                rotate_btn.config(state="normal")
+                return
+            bus.ok("Key Rotation", "Passphrase verified")
+        except Exception as e:
+            bus.error("Key Rotation", f"Passphrase verification failed: {e}")
+            status_var.set(f"Error verifying passphrase: {e}")
+            rotate_btn.config(state="normal")
+            return
+
+        # Step 2: Generate new key pairs
+        bus.info("Key Rotation", "Generating new RSA-2048 key pair (auth)...")
+        try:
+            new_bundle = {}
+            for purpose in ["auth", "signing", "encryption"]:
+                bus.info("Key Rotation", f"Generating new RSA-2048 key pair ({purpose})...")
+                priv_key = CryptoUtils.generate_rsa_key_pair(2048)
+                priv_pem = CryptoUtils.serialize_private_key(priv_key)
+                pub_pem = CryptoUtils.serialize_public_key(priv_key.public_key()).decode()
+
+                encrypted_priv = LocalKeyManager.protect_key_bundle(priv_pem, login_pass, recovery_pass)
+                new_bundle[purpose] = {
+                    "encrypted_priv": encrypted_priv,
+                    "pub_pem": pub_pem,
+                    "priv_pem": priv_pem,
+                }
+                bus.ok("Key Rotation", f"{purpose.capitalize()} key pair generated")
+
+        except Exception as e:
+            bus.error("Key Rotation", f"Key generation failed: {e}")
+            status_var.set(f"Error generating keys: {e}")
+            rotate_btn.config(state="normal")
+            return
+
+        # Step 3: Call API to rotate keys (revokes old certs + issues new ones)
+        bus.info("Key Rotation", "Revoking old certificates and issuing new ones...")
+        try:
+            api_bundle = {}
+            for purpose in ["auth", "signing", "encryption"]:
+                api_bundle[purpose] = {
+                    "encrypted_priv": new_bundle[purpose]["encrypted_priv"],
+                    "pub_pem": new_bundle[purpose]["pub_pem"],
+                }
+
+            ok, msg = self.api.rotate_keys(username, api_bundle)
+            if not ok:
+                bus.error("Key Rotation", f"Rotation failed: {msg}")
+                status_var.set(f"Rotation failed: {msg}")
+                rotate_btn.config(state="normal")
+                return
+            bus.ok("Key Rotation", "Old certificates revoked, new certificates issued")
+        except Exception as e:
+            bus.error("Key Rotation", f"API rotation failed: {e}")
+            status_var.set(f"Rotation failed: {e}")
+            rotate_btn.config(state="normal")
+            return
+
+        # Step 4: Save new encrypted keys locally
+        bus.info("Key Rotation", "Saving new encrypted keys...")
+        try:
+            for purpose in ["auth", "signing", "encryption"]:
+                key_path = self._safe_key_path(username, purpose)
+                self._secure_write_json(key_path, new_bundle[purpose]["encrypted_priv"])
+            bus.ok("Key Rotation", "New keys saved locally")
+        except Exception as e:
+            bus.error("Key Rotation", f"Failed to save keys: {e}")
+            status_var.set(f"Warning: Keys rotated but failed to save locally: {e}")
+
+        # Step 5: Update session with new private keys
+        bus.info("Key Rotation", "Updating session credentials...")
+        try:
+            self.session["enc_priv"] = bytearray(new_bundle["encryption"]["priv_pem"])
+            self.session["sign_priv"] = bytearray(new_bundle["signing"]["priv_pem"])
+            bus.ok("Key Rotation", "Session updated with new credentials")
+        except Exception as e:
+            bus.error("Key Rotation", f"Session update warning: {e}")
+
+        bus.ok("Key Rotation", "Key rotation completed successfully")
+
+        # Clear sensitive data
+        login_pass = None
+        recovery_pass = None
+        for purpose in new_bundle:
+            new_bundle[purpose]["priv_pem"] = None
+
+        # Close popup and show success
+        popup.destroy()
+        messagebox.showinfo(
+            "Key Rotation Complete",
+            "Your keys have been rotated successfully.\n\n"
+            "• Old certificates have been revoked\n"
+            "• New certificates have been issued\n"
+            "• You remain logged in with new credentials",
+        )
+        self._set_status("Keys rotated successfully")
 
     def _load_config(self):
         """Load application settings from app data config (includes session security policy)."""
@@ -4436,6 +4881,7 @@ class VaultTkApp:
         self.sort_column_var.set("Service")
         ttk.Button(top_row1, text="Export CSV", command=self._export_csv_flow, style="Secondary.TButton").pack(side="left", padx=6)
         ttk.Button(top_row1, text="Export JSON", command=self._export_json_flow, style="Secondary.TButton").pack(side="left", padx=2)
+        ttk.Button(top_row1, text="Verify Export", command=self._verify_export_flow, style="Secondary.TButton").pack(side="left", padx=8)
 
         top_row2 = ttk.Frame(top)
         top_row2.pack(fill="x")
@@ -5354,7 +5800,9 @@ class VaultTkApp:
         ids = self._get_selected_entry_ids()
         if not ids:
             return messagebox.showwarning("Delete", "Select at least one entry to delete.")
-        if not self._require_step_up_or_phrase("delete_secret", "delete selected password entries"):
+        
+        # Always require password for delete operations (no step-up TTL bypass)
+        if not self._require_phrase("delete selected password entries"):
             return
 
         if len(ids) > 1:
@@ -5435,10 +5883,22 @@ class VaultTkApp:
         self._undo_buffer = None
 
     def _update_strength_meter(self):
+        # Check if widgets still exist before updating
+        if not hasattr(self, "strength_canvas") or not self.strength_canvas:
+            return
+        try:
+            if not self.strength_canvas.winfo_exists():
+                return
+        except Exception:
+            return
+
         pwd = self.password_var.get()
         if not pwd:
-            self.strength_canvas.delete("all")
-            self.strength_label.config(text="")
+            try:
+                self.strength_canvas.delete("all")
+                self.strength_label.config(text="")
+            except Exception:
+                pass
             return
 
         score, reasons = self.api.calculate_strength(pwd)
@@ -5448,12 +5908,15 @@ class VaultTkApp:
         if reasons and score < 4:
             label += f" ({reasons[0]})"
 
-        self.strength_canvas.delete("all")
-        w = self.strength_canvas.winfo_width()
-        if w < 10: w = 240 # fallback
-        fill_w = (w * (score + 1)) / 5
-        self.strength_canvas.create_rectangle(0, 0, fill_w, 6, fill=color, outline="")
-        self.strength_label.config(text=label, foreground=color)
+        try:
+            self.strength_canvas.delete("all")
+            w = self.strength_canvas.winfo_width()
+            if w < 10: w = 240 # fallback
+            fill_w = (w * (score + 1)) / 5
+            self.strength_canvas.create_rectangle(0, 0, fill_w, 6, fill=color, outline="")
+            self.strength_label.config(text=label, foreground=color)
+        except Exception:
+            pass
 
     # ---------------------- import ----------------------
     def _build_import_page(self):
@@ -5835,26 +6298,43 @@ class VaultTkApp:
             status = self.api.get_backup_status(uid)
             if not status.get("enabled") or not status.get("backup_on_change_enabled"):
                 return
+
+            # Get encryption certificate for auto-repair of corrupted entries
+            cert_pem = self._get_current_enc_cert()
+            cert_bytes = cert_pem.encode("utf-8") if isinstance(cert_pem, str) else cert_pem
+
             key_or_pass = None
             mode = None
+
+            # Try to get credentials from the Backup page field
             if hasattr(self, "backup_recovery_key_var"):
                 key_or_pass = (self.backup_recovery_key_var.get() or "").strip()
+
             if key_or_pass:
                 ok_resolve, mode, err = self.api.resolve_recovery_factor(uid, key_or_pass)
                 if ok_resolve:
                     ok, msg = self.api.create_local_backup_now(
                         uid, enc_priv_bytes, reason="change_triggered",
-                        recovery_key_or_password=key_or_pass, mode=mode
+                        recovery_key_or_password=key_or_pass, mode=mode, cert_pem=cert_bytes
                     )
                     if ok:
                         self.api.set_auto_backup_key_for_session(uid, key_or_pass, mode)
-                else:
-                    ok, msg = False, err
-            else:
-                ok, msg = self.api.create_local_backup_now(uid, enc_priv_bytes, reason="change_triggered")
-            if ok and hasattr(self, "backup_phase2_status_var"):
-                self.refresh_backup_page()
+                        self.refresh_backup_page()
+                        self._show_toast("Backup created after import", "success")
+                    return
+                # Invalid credentials entered, try cached
+                key_or_pass = None
+
+            # Try using cached credentials (set via 30-second popup or previous successful backup)
+            ok, msg = self.api.create_local_backup_now(uid, enc_priv_bytes, reason="change_triggered", cert_pem=cert_bytes)
+            if ok:
+                if hasattr(self, "backup_phase2_status_var"):
+                    self.refresh_backup_page()
                 self._show_toast("Backup created after import", "success")
+            elif "Provide recovery key" in (msg or "") or "not enabled for this mode" in (msg or ""):
+                # No cached credentials available - silently skip (user can do manual backup later)
+                # The 30-second popup will appear and prompt them to enter credentials
+                pass
         except Exception:
             pass
 
@@ -6269,10 +6749,15 @@ class VaultTkApp:
             messagebox.showerror("Backup", "Session key not available. Re-login.")
             return
         enc_priv_bytes = bytes(enc_priv) if isinstance(enc_priv, bytearray) else enc_priv
+        
+        # Get encryption certificate for auto-repair of corrupted entries
+        cert_pem = self._get_current_enc_cert()
+        cert_bytes = cert_pem.encode("utf-8") if isinstance(cert_pem, str) else cert_pem
+        
         try:
             ok, msg = self.api.create_local_backup_now(
                 int(self.session["user_id"]), enc_priv_bytes, reason="manual",
-                recovery_key_or_password=key_or_pass, mode=mode,
+                recovery_key_or_password=key_or_pass, mode=mode, cert_pem=cert_bytes,
             )
             if not ok:
                 try:
@@ -6588,9 +7073,14 @@ class VaultTkApp:
             messagebox.showerror("Backup", "Session key not available. Re-login and try again.")
             return
         enc_priv_bytes = bytes(enc_priv) if isinstance(enc_priv, bytearray) else enc_priv
+        
+        # Get encryption certificate for auto-repair of corrupted entries
+        cert_pem = self._get_current_enc_cert()
+        cert_bytes = cert_pem.encode("utf-8") if isinstance(cert_pem, str) else cert_pem
+        
         try:
             ok, msg, _ = self.api.export_user_backup_encrypted(
-                int(self.session["user_id"]), enc_priv_bytes, out_path, key_or_pass, mode
+                int(self.session["user_id"]), enc_priv_bytes, out_path, key_or_pass, mode, cert_pem=cert_bytes
             )
             if not ok:
                 messagebox.showerror("Backup export failed", msg)
@@ -7634,17 +8124,55 @@ class VaultTkApp:
             return
 
         try:
-            # Convert bytearray to bytes for API call
+            # Convert bytearray to bytes for API calls
             enc_priv_bytes = bytes(self.session["enc_priv"]) if isinstance(self.session["enc_priv"], bytearray) else self.session["enc_priv"]
-            csv_data = self.api.export_secrets_as_csv(self.session["user_id"], enc_priv_bytes)
+            sign_priv = self.session.get("sign_priv")
+            if not sign_priv:
+                return messagebox.showerror(
+                    "Signing required",
+                    "A signing key is not unlocked for this session.\n\n"
+                    "Unlock your signing key (login/unlock) before exporting a signed CSV.",
+                )
+
+            sign_priv_bytes = bytes(sign_priv) if isinstance(sign_priv, (bytearray, memoryview)) else sign_priv
+
+            ok, msg, csv_data, sig_bundle = self.api.export_signed_secrets(
+                "csv",
+                self.session["user_id"],
+                enc_priv_bytes,
+                sign_priv_bytes,
+            )
+            if not ok:
+                return messagebox.showerror("Export Failed", msg or "Export failed")
+
             if not csv_data:
                 return messagebox.showinfo("Export", "Vault is empty.")
-                
-            with open(out_path, "w", encoding="utf-8", newline="") as f:
-                f.write(csv_data)
-                
-            self._set_status("Vault exported to cleartext CSV")
-            messagebox.showinfo("Export Successful", f"Vault saved to cleartext CSV:\n{out_path}\n\nWARNING: This file is unencrypted!")
+
+            # Write exact bytes we signed (binary mode) so verification matches on all platforms
+            with open(out_path, "wb") as f:
+                f.write(csv_data.encode("utf-8"))
+
+            # Save detached signature bundle alongside CSV
+            sig_path = out_path + ".sig.json"
+            try:
+                with open(sig_path, "w", encoding="utf-8") as sf:
+                    json.dump(sig_bundle, sf, indent=2, ensure_ascii=False)
+            except Exception:
+                # If signature file fails to write, still keep main export but warn user
+                return messagebox.showwarning(
+                    "Export Partially Signed",
+                    f"Vault CSV saved to:\n{out_path}\n\n"
+                    f"WARNING: Signature file could not be written.\n"
+                    f"Message: {msg}",
+                )
+
+            self._set_status("Vault exported and signed (CSV)")
+            messagebox.showinfo(
+                "Export Successful",
+                f"Vault saved to cleartext CSV:\n{out_path}\n\n"
+                f"Signature bundle saved to:\n{sig_path}\n\n"
+                "WARNING: The CSV file is unencrypted. Store both files securely.",
+            )
         except Exception as e:
             messagebox.showerror("Export Failed", str(e))
     
@@ -7667,19 +8195,288 @@ class VaultTkApp:
             return
 
         try:
-            # Convert bytearray to bytes for API call
+            # Convert bytearray to bytes for API calls
             enc_priv_bytes = bytes(self.session["enc_priv"]) if isinstance(self.session["enc_priv"], bytearray) else self.session["enc_priv"]
-            json_data = self.api.export_secrets_as_json(self.session["user_id"], enc_priv_bytes)
+            sign_priv = self.session.get("sign_priv")
+            if not sign_priv:
+                return messagebox.showerror(
+                    "Signing required",
+                    "A signing key is not unlocked for this session.\n\n"
+                    "Unlock your signing key (login/unlock) before exporting a signed JSON file.",
+                )
+
+            sign_priv_bytes = bytes(sign_priv) if isinstance(sign_priv, (bytearray, memoryview)) else sign_priv
+
+            ok, msg, json_data, sig_bundle = self.api.export_signed_secrets(
+                "json",
+                self.session["user_id"],
+                enc_priv_bytes,
+                sign_priv_bytes,
+            )
+            if not ok:
+                return messagebox.showerror("Export Failed", msg or "Export failed")
+
             if not json_data or json_data == "[]":
                 return messagebox.showinfo("Export", "Vault is empty.")
-                
-            with open(out_path, "w", encoding="utf-8") as f:
-                f.write(json_data)
-                
-            self._set_status("Vault exported to cleartext JSON")
-            messagebox.showinfo("Export Successful", f"Vault saved to cleartext JSON:\n{out_path}\n\nWARNING: This file is unencrypted!")
+
+            # Write exact bytes we signed (binary mode) so verification matches on all platforms
+            with open(out_path, "wb") as f:
+                f.write(json_data.encode("utf-8"))
+
+            sig_path = out_path + ".sig.json"
+            try:
+                with open(sig_path, "w", encoding="utf-8") as sf:
+                    json.dump(sig_bundle, sf, indent=2, ensure_ascii=False)
+            except Exception:
+                return messagebox.showwarning(
+                    "Export Partially Signed",
+                    f"Vault JSON saved to:\n{out_path}\n\n"
+                    f"WARNING: Signature file could not be written.\n"
+                    f"Message: {msg}",
+                )
+
+            self._set_status("Vault exported and signed (JSON)")
+            messagebox.showinfo(
+                "Export Successful",
+                f"Vault saved to cleartext JSON:\n{out_path}\n\n"
+                f"Signature bundle saved to:\n{sig_path}\n\n"
+                "WARNING: The JSON file is unencrypted. Store both files securely.",
+            )
         except Exception as e:
             messagebox.showerror("Export Failed", str(e))
+
+    def _verify_export_flow(self):
+        """Open Verify Export popup with separate upload sections and Submit."""
+        if not self.session:
+            return messagebox.showwarning("Verify Export", "Login first.")
+
+        popup = tk.Toplevel(self.root)
+        popup.title("Verify Export")
+        popup.configure(bg=self.palette.get("bg", "#121212"))
+        popup.geometry("560x380")
+        popup.minsize(480, 320)
+        popup.attributes("-topmost", True)
+        popup.lift()
+        popup.focus_force()
+
+        main = tk.Frame(popup, bg=self.palette.get("bg", "#121212"), padx=20, pady=16)
+        main.pack(fill="both", expand=True)
+
+        # Header
+        tk.Label(
+            main,
+            text="Verify Export",
+            font=self.font_title,
+            bg=self.palette.get("bg", "#121212"),
+            fg=self.palette.get("text", "#ffffff"),
+        ).pack(anchor="w", pady=(0, 4))
+        tk.Label(
+            main,
+            text="Select the export file and its signature bundle, then click Submit.",
+            font=self.font_small,
+            bg=self.palette.get("bg", "#121212"),
+            fg=self.palette.get("muted", "#888888"),
+        ).pack(anchor="w", pady=(0, 20))
+
+        # Section 1: Export file
+        doc_frame = tk.LabelFrame(
+            main,
+            text="Export file (CSV or JSON)",
+            font=self.font_nav,
+            bg=self.palette.get("panel", "#1e1e1e"),
+            fg=self.palette.get("text", "#ffffff"),
+        )
+        doc_frame.pack(fill="x", pady=(0, 12))
+        self._verify_doc_var = tk.StringVar()
+        doc_entry = self._make_entry(doc_frame, self._verify_doc_var)
+        doc_entry.pack(side="left", fill="x", expand=True, padx=10, pady=10)
+
+        def _browse_doc():
+            popup.attributes("-topmost", False)
+            path = filedialog.askopenfilename(
+                parent=popup,
+                title="Select exported vault file (CSV or JSON)",
+                filetypes=[
+                    ("CSV or JSON files", "*.csv *.json"),
+                    ("CSV files", "*.csv"),
+                    ("JSON files", "*.json"),
+                    ("All files", "*.*"),
+                ],
+            )
+            popup.attributes("-topmost", True)
+            popup.lift()
+            popup.focus_force()
+            if path:
+                self._verify_doc_var.set(path)
+
+        tk.Button(
+            doc_frame,
+            text="Browse",
+            relief="flat",
+            bg=self.palette.get("accent", "#3b82f6"),
+            fg="white",
+            font=self.font_small,
+            padx=12,
+            pady=4,
+            cursor="hand2",
+            command=_browse_doc,
+        ).pack(side="right", padx=10, pady=10)
+
+        # Section 2: Signature bundle
+        sig_frame = tk.LabelFrame(
+            main,
+            text="Signature bundle (.sig.json)",
+            font=self.font_nav,
+            bg=self.palette.get("panel", "#1e1e1e"),
+            fg=self.palette.get("text", "#ffffff"),
+        )
+        sig_frame.pack(fill="x", pady=(0, 12))
+        self._verify_sig_var = tk.StringVar()
+        sig_entry = self._make_entry(sig_frame, self._verify_sig_var)
+        sig_entry.pack(side="left", fill="x", expand=True, padx=10, pady=10)
+
+        def _browse_sig():
+            popup.attributes("-topmost", False)
+            path = filedialog.askopenfilename(
+                parent=popup,
+                title="Select signature bundle (.sig.json)",
+                filetypes=[
+                    ("Signature bundle", "*.json"),
+                    ("All files", "*.*"),
+                ],
+            )
+            popup.attributes("-topmost", True)
+            popup.lift()
+            popup.focus_force()
+            if path:
+                self._verify_sig_var.set(path)
+
+        tk.Button(
+            sig_frame,
+            text="Browse",
+            relief="flat",
+            bg=self.palette.get("accent", "#3b82f6"),
+            fg="white",
+            font=self.font_small,
+            padx=12,
+            pady=4,
+            cursor="hand2",
+            command=_browse_sig,
+        ).pack(side="right", padx=10, pady=10)
+
+        # Result label
+        result_frame = tk.Frame(main, bg=self.palette.get("bg", "#121212"))
+        result_frame.pack(fill="x", pady=(0, 12))
+        self._verify_result_var = tk.StringVar(value="")
+        result_lbl = tk.Label(
+            result_frame,
+            textvariable=self._verify_result_var,
+            font=self.font_small,
+            bg=self.palette.get("bg", "#121212"),
+            fg=self.palette.get("text", "#ffffff"),
+            wraplength=500,
+            justify="left",
+        )
+        result_lbl.pack(anchor="w")
+
+        # Submit button
+        def _do_verify():
+            data_path = self._verify_doc_var.get().strip()
+            sig_path = self._verify_sig_var.get().strip()
+            self._verify_result_var.set("")
+            popup.update_idletasks()
+
+            if not data_path:
+                get_bus().error("Verify Export", "Export file path is empty")
+                self._verify_result_var.set("Please select an export file.")
+                return
+            if not sig_path:
+                get_bus().error("Verify Export", "Signature bundle path is empty")
+                self._verify_result_var.set("Please select a signature bundle.")
+                return
+
+            bus = get_bus()
+            bus.info("Verify Export", "Verification started", step="Init")
+
+            try:
+                bus.info("Verify Export", "Loading export file...", step="Load document")
+                with open(data_path, "rb") as f:
+                    payload_bytes = f.read()
+                bus.info("Verify Export", f"Loaded {len(payload_bytes)} bytes", step="Load document")
+
+                bus.info("Verify Export", "Loading signature bundle...", step="Load bundle")
+                with open(sig_path, "r", encoding="utf-8") as sf:
+                    bundle = json.load(sf)
+                bus.info("Verify Export", "Signature bundle loaded", step="Load bundle")
+
+                bus.info("Verify Export", "Verifying hash and signature...", step="Verify")
+                ok, result = self.api.verify_vault_export(payload_bytes, bundle)
+
+                status = result.get("status", "invalid")
+                reason = result.get("reason", "")
+                hash_matches = result.get("hash_matches")
+                sig_valid = result.get("signature_valid")
+                cert_valid = result.get("cert_valid")
+
+                # Emit each check to terminal
+                bus.info("Verify Export", f"Hash matches: {'Yes' if hash_matches else 'No'}", step="Hash")
+                bus.info("Verify Export", f"Signature valid: {'Yes' if sig_valid else 'No'}", step="Signature")
+                bus.info("Verify Export", f"Certificate valid: {'Yes' if cert_valid else 'No'}", step="Certificate")
+
+                if ok and status == "valid":
+                    bus.ok("Verify Export", "Verification successful — export file and signature are valid")
+                    self._verify_result_var.set(
+                        f"Valid — Export file and signature are authentic.\n"
+                        f"Hash matches: Yes  |  Signature valid: Yes  |  Certificate valid: Yes\n"
+                        f"Signer serial: {result.get('cert_serial', 'N/A')}  |  Signed at: {result.get('created_at') or 'N/A'}"
+                    )
+                else:
+                    bus.error("Verify Export", f"Verification failed: {reason or 'Unknown'}")
+                    self._verify_result_var.set(
+                        f"Invalid — Verification failed.\n"
+                        f"Reason: {reason or 'Unknown'}\n"
+                        f"Hash matches: {'Yes' if hash_matches else 'No'}  |  "
+                        f"Signature valid: {'Yes' if sig_valid else 'No'}  |  "
+                        f"Certificate valid: {'Yes' if cert_valid else 'No'}\n"
+                        f"Signer serial: {result.get('cert_serial') or 'N/A'}"
+                    )
+            except FileNotFoundError as e:
+                bus.error("Verify Export", "File not found")
+                self._verify_result_var.set(f"Error: File not found.\n{str(e)}")
+            except json.JSONDecodeError as e:
+                bus.error("Verify Export", f"Invalid JSON in signature bundle: {str(e)}")
+                self._verify_result_var.set(f"Error: Invalid signature bundle (JSON parse failed).\n{str(e)}")
+            except Exception as e:
+                bus.error("Verify Export", f"Verification error: {str(e)}")
+                self._verify_result_var.set(f"Error: {str(e)}")
+
+        btn_frame = tk.Frame(main, bg=self.palette.get("bg", "#121212"))
+        btn_frame.pack(pady=(12, 0))
+        submit_btn = tk.Button(
+            btn_frame,
+            text="Submit",
+            relief="flat",
+            bg=self.palette.get("success", "#22c55e"),
+            fg="white",
+            font=self.font_button,
+            padx=24,
+            pady=8,
+            cursor="hand2",
+            command=_do_verify,
+        )
+        submit_btn.pack(side="left", padx=4)
+        tk.Button(
+            btn_frame,
+            text="Close",
+            relief="flat",
+            bg=self.palette.get("panel", "#1e1e1e"),
+            fg=self.palette.get("muted", "#888888"),
+            font=self.font_button,
+            padx=20,
+            pady=8,
+            cursor="hand2",
+            command=popup.destroy,
+        ).pack(side="left", padx=4)
 
     def _logout(self):
         # CRITICAL SECURITY FIX: Wipe all sensitive data before logout

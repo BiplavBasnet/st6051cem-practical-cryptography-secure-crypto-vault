@@ -10,6 +10,7 @@ from services.database import DBManager
 from services.audit_log import AuditLog
 from services.app_paths import keys_dir as app_keys_dir
 from services.structured_logger import get_logger
+from services.status_bus import get_bus
 
 _MIGRATE_LOG_SHOWN = False
 
@@ -121,11 +122,16 @@ class UserService:
 
     def register_user(self, username, email, key_bundle=None):
         """Register user with purpose-separated keys and certificates."""
+        bus = get_bus()
+        bus.info("Register", "Validating registration data...")
+        
         valid, msg = self._validate_username_email(username, email)
         if not valid:
+            bus.error("Register", f"Validation failed: {msg}")
             return False, msg
 
         if not key_bundle:
+            bus.error("Register", "Missing key bundle")
             return False, "Client-side key bundle is required"
 
         conn = self.db.get_connection()
@@ -134,8 +140,10 @@ class UserService:
         try:
             cursor.execute("SELECT id FROM users WHERE username = ? OR email = ?", (username, email))
             if cursor.fetchone():
+                bus.error("Register", "Username or email already exists")
                 return False, "Username or Email already exists"
 
+            bus.info("Register", "Generating RSA key pairs...", step="Key Gen")
             user_keys_dir = self._safe_user_dir(username)
             self._secure_mkdir(user_keys_dir, 0o700)
 
@@ -154,6 +162,7 @@ class UserService:
                         mode=0o600,
                     )
 
+                bus.info("Register", f"Issuing {purpose} certificate...", step="Cert Issue")
                 cert_pem = self.pki.issue_user_certificate(username, pub_key, purpose=purpose)
                 cert_path = user_keys_dir / f"{purpose}_cert.pem"
                 self._secure_write_bytes(cert_path, cert_pem, mode=0o644)
@@ -163,6 +172,7 @@ class UserService:
                     "priv_key_path": str(priv_key_path),
                 }
 
+            bus.info("Register", "Creating user record...", step="Save User")
             cursor.execute(
                 """
                 INSERT INTO users (username, email, auth_cert_serial)
@@ -197,9 +207,11 @@ class UserService:
 
             conn.commit()
             self.audit_log.log_event("USER_REGISTRATION", {"username": username, "email": email}, user_id=user_id)
+            bus.ok("Register", "User registered successfully")
             return True, f"User {username} registered successfully."
 
         except Exception as e:
+            bus.error("Register", "Registration failed")
             conn.rollback()
             self.audit_log.log_event("REGISTRATION_ERROR", {"username": username, "error": str(e)})
             return False, f"Registration failed: {str(e)}"
@@ -208,11 +220,16 @@ class UserService:
 
     def rotate_keys(self, username, key_bundle=None):
         """Rotate all user keys and issue new certificates."""
+        bus = get_bus()
+        bus.info("Key Rotation", f"Starting server-side key rotation for {username}...")
+
         if not key_bundle:
+            bus.error("Key Rotation", "Missing key bundle")
             return False, "Client-side key bundle is required for rotation"
 
         user = self.get_user_by_username(username)
         if not user:
+            bus.error("Key Rotation", "User not found")
             return False, "User not found"
 
         user_keys_dir = self._safe_user_dir(username)
@@ -222,6 +239,7 @@ class UserService:
         old_keys_dir = user_keys_dir / f"old_{timestamp}"
         self._secure_mkdir(old_keys_dir, 0o700)
 
+        bus.info("Key Rotation", "Archiving old key files...")
         for f in user_keys_dir.iterdir():
             if f.is_file() and not f.name.startswith("old_"):
                 f.rename(old_keys_dir / f.name)
@@ -233,7 +251,7 @@ class UserService:
             purposes = ["auth", "signing", "encryption"]
             from cryptography import x509
 
-            # Revoke currently active certs before issuing replacements.
+            bus.info("Key Rotation", "Revoking active certificates...")
             cursor.execute(
                 """
                 UPDATE certificates
@@ -243,8 +261,10 @@ class UserService:
                 (user["id"],),
             )
             revoked_count = cursor.rowcount
+            bus.ok("Key Rotation", f"Revoked {revoked_count} certificate(s)")
 
             for purpose in purposes:
+                bus.info("Key Rotation", f"Issuing new {purpose} certificate...")
                 pub_key, encrypted_priv = self._parse_pub_from_bundle(key_bundle, purpose)
 
                 priv_key_path = user_keys_dir / f"{purpose}_key.pem"
@@ -272,6 +292,7 @@ class UserService:
                         purpose,
                     ),
                 )
+                bus.ok("Key Rotation", f"{purpose.capitalize()} certificate issued")
 
             conn.commit()
             self.audit_log.log_event(
@@ -279,9 +300,11 @@ class UserService:
                 {"username": username, "revoked_old_certs": max(0, revoked_count)},
                 user_id=user["id"],
             )
+            bus.ok("Key Rotation", f"Key rotation completed for {username}")
             return True, f"Keys rotated successfully for {username}."
         except Exception as e:
             conn.rollback()
+            bus.error("Key Rotation", f"Rotation failed: {e}")
             return False, f"Key rotation failed: {str(e)}"
         finally:
             conn.close()
@@ -312,6 +335,9 @@ class UserService:
         return row["cert_data"] if row else None
 
     def revoke_certificate(self, serial_number):
+        bus = get_bus()
+        bus.info("Cert Revoke", "Revoking certificate...")
+        
         conn = self.db.get_connection()
         cursor = conn.cursor()
         cursor.execute("SELECT user_id FROM certificates WHERE serial_number = ? LIMIT 1", (serial_number,))
@@ -323,7 +349,9 @@ class UserService:
         conn.close()
         if changed:
             self.audit_log.log_event("CERT_REVOCATION", {"serial_number": serial_number}, user_id=user_id)
+            bus.ok("Cert Revoke", "Certificate revoked")
             return True, "Certificate revoked successfully"
+        bus.error("Cert Revoke", "Certificate not found")
         return False, "Certificate not found"
 
     def get_user_by_username(self, username):

@@ -20,6 +20,7 @@ from services.app_paths import backups_dir_for_user
 from services.audit_log import AuditLog
 from services.crypto_utils import CryptoUtils
 from services.database import DBManager
+from services.status_bus import get_bus
 
 
 # Format version for backup envelope
@@ -435,14 +436,84 @@ class BackupService:
         self._log_backup_event(user_id, "BACKUP_RECOVERY_ENABLED", {"mode": "backup_password"})
         return True, "Backup password set. Use it only for backup/restore."
 
-    def _build_backup_payload(self, user_id: int, priv_key_data: bytes) -> Tuple[Optional[bytes], Optional[str]]:
-        """Build canonical backup payload (current user's vault only). Returns (payload_bytes, error_message)."""
+    def _build_backup_payload(
+        self, user_id: int, priv_key_data: bytes, cert_pem: Optional[bytes] = None
+    ) -> Tuple[Optional[bytes], Optional[str]]:
+        """Build canonical backup payload (current user's vault only). Returns (payload_bytes, error_message).
+        
+        If cert_pem is provided, corrupted entries with plaintext passwords will be auto-repaired.
+        Entries that cannot be decrypted or repaired are skipped with a warning.
+        """
+        bus = get_bus()
         metadata = self.secret_service.get_secrets_metadata(user_id)
         entries: List[Dict] = []
+        skipped_count = 0
+        skipped_ids: List[int] = []
+        repaired_count = 0
+
         for m in metadata:
-            pwd, msg = self.secret_service.decrypt_secret(user_id, m["id"], priv_key_data)
-            if pwd is None:
-                return None, f"Failed to export entry {m['id']}: {msg}"
+            entry_id = m["id"]
+            pwd_data = None
+            
+            try:
+                pwd_data, msg = self.secret_service.decrypt_secret(user_id, entry_id, priv_key_data)
+                if pwd_data is None:
+                    # Decryption failed - attempt auto-repair if certificate is available
+                    if cert_pem:
+                        bus.info("Backup", f"Attempting auto-repair for entry {entry_id}...")
+                        repaired, repair_msg, recovered_pwd = self.secret_service.repair_corrupted_entry(
+                            user_id, entry_id, cert_pem
+                        )
+                        if repaired and recovered_pwd:
+                            bus.ok("Backup", f"Entry {entry_id} auto-repaired during backup")
+                            repaired_count += 1
+                            # Now decrypt should work, or use recovered password directly
+                            pwd_data = {"password": recovered_pwd, "totp_secret": None}
+                        else:
+                            bus.warn("Backup", f"Could not repair entry {entry_id}: {repair_msg}")
+                            skipped_count += 1
+                            skipped_ids.append(entry_id)
+                            continue
+                    else:
+                        bus.warn("Backup", f"Skipping corrupted entry {entry_id}: {msg}")
+                        skipped_count += 1
+                        skipped_ids.append(entry_id)
+                        continue
+                        
+            except Exception as e:
+                # Exception during decryption - try repair
+                if cert_pem:
+                    bus.info("Backup", f"Attempting auto-repair for entry {entry_id} after error...")
+                    try:
+                        repaired, repair_msg, recovered_pwd = self.secret_service.repair_corrupted_entry(
+                            user_id, entry_id, cert_pem
+                        )
+                        if repaired and recovered_pwd:
+                            bus.ok("Backup", f"Entry {entry_id} auto-repaired during backup")
+                            repaired_count += 1
+                            pwd_data = {"password": recovered_pwd, "totp_secret": None}
+                        else:
+                            bus.warn("Backup", f"Could not repair entry {entry_id}: {repair_msg}")
+                            skipped_count += 1
+                            skipped_ids.append(entry_id)
+                            continue
+                    except Exception as repair_err:
+                        bus.warn("Backup", f"Repair failed for entry {entry_id}: {repair_err}")
+                        skipped_count += 1
+                        skipped_ids.append(entry_id)
+                        continue
+                else:
+                    bus.warn("Backup", f"Skipping entry {entry_id} due to error: {e}")
+                    skipped_count += 1
+                    skipped_ids.append(entry_id)
+                    continue
+
+            # Extract password from pwd_data
+            if isinstance(pwd_data, dict):
+                pwd = pwd_data.get("password", "")
+            else:
+                pwd = pwd_data
+                
             entries.append({
                 "service": m.get("service_name") or m.get("service", ""),
                 "username": m.get("username_email") or m.get("username", ""),
@@ -451,10 +522,21 @@ class BackupService:
                 "created_at": str(m.get("created_at", "")),
             })
 
+        if repaired_count > 0:
+            bus.ok("Backup", f"Auto-repaired {repaired_count} corrupted entries")
+
+        if skipped_count > 0:
+            bus.warn("Backup", f"Skipped {skipped_count} corrupted entries (IDs: {skipped_ids[:5]}{'...' if len(skipped_ids) > 5 else ''})")
+
+        if not entries and metadata:
+            return None, f"All {len(metadata)} entries are corrupted and could not be backed up"
+
         payload = {
             "payload_format": PAYLOAD_FORMAT,
             "exported_at": datetime.datetime.utcnow().isoformat(),
             "entries": entries,
+            "skipped_corrupted": skipped_count,
+            "repaired_count": repaired_count,
         }
         return json.dumps(payload, ensure_ascii=False, separators=(",", ":")).encode("utf-8"), None
 
@@ -489,8 +571,12 @@ class BackupService:
         priv_key_data: bytes,
         recovery_key_or_password: str,
         mode: str,
+        cert_pem: Optional[bytes] = None,
     ) -> Tuple[Optional[Dict], Optional[str]]:
-        """Build encrypted backup envelope (no write). Returns (envelope_dict, error_message)."""
+        """Build encrypted backup envelope (no write). Returns (envelope_dict, error_message).
+        
+        If cert_pem is provided, corrupted entries will be auto-repaired during backup.
+        """
         if mode not in ("recovery_key", "backup_password"):
             return None, "Invalid backup mode"
         cfg = self._get_config(user_id)
@@ -502,7 +588,7 @@ class BackupService:
         else:
             if not self._verify_backup_password(user_id, recovery_key_or_password):
                 return None, "Invalid backup recovery key or password"
-        payload_bytes, err = self._build_backup_payload(user_id, priv_key_data)
+        payload_bytes, err = self._build_backup_payload(user_id, priv_key_data, cert_pem)
         if err:
             return None, err
         salt = os.urandom(16)
@@ -543,16 +629,22 @@ class BackupService:
         destination_path_or_bytes: Union[str, Path, type(None)],
         recovery_key_or_password: str,
         mode: str = "recovery_key",
+        cert_pem: Optional[bytes] = None,
     ) -> Tuple[bool, str, Optional[Dict]]:
         """
         Export current user's vault as an encrypted backup.
         destination_path_or_bytes: file path to write, or None to return bundle dict only.
         mode: 'recovery_key' | 'backup_password'
+        cert_pem: If provided, corrupted entries will be auto-repaired during backup.
         Returns (success, message, bundle_dict_if_not_written_to_file).
         """
-        envelope, err = self._build_encrypted_envelope(user_id, priv_key_data, recovery_key_or_password, mode)
+        bus = get_bus()
+        bus.info("Backup Create", "Collecting vault data...")
+        envelope, err = self._build_encrypted_envelope(user_id, priv_key_data, recovery_key_or_password, mode, cert_pem)
         if err:
+            bus.error("Backup Create", f"Backup failed: {err}")
             return False, err, None
+        bus.info("Backup Create", "Encrypting backup...", step="Encrypt")
         self._update_last_backup(user_id)
         self.audit.log_event(
             "local_backup_created",
@@ -566,11 +658,15 @@ class BackupService:
         )
         if destination_path_or_bytes is not None:
             path = Path(destination_path_or_bytes)
+            bus.info("Backup Create", "Writing backup file...", step="Save")
             try:
                 path.write_text(json.dumps(envelope, separators=(",", ":")), encoding="utf-8")
             except Exception as e:
+                bus.error("Backup Create", "Failed to write backup file")
                 return False, str(e), None
+            bus.ok("Backup Create", "Backup created successfully")
             return True, f"Backup saved to {path}", None
+        bus.ok("Backup Create", "Backup created")
         return True, "Backup created", envelope
 
     def decrypt_backup_package(
@@ -583,6 +679,8 @@ class BackupService:
         Decrypt and parse backup package. Returns (success, message, payload_dict).
         payload_dict has 'entries' and 'payload_format'.
         """
+        bus = get_bus()
+        bus.info("Backup Decrypt", "Validating backup file...")
         try:
             if isinstance(backup_bytes_or_path, (str, Path)):
                 raw = Path(backup_bytes_or_path).read_bytes()
@@ -590,9 +688,11 @@ class BackupService:
                 raw = backup_bytes_or_path
             envelope = json.loads(raw.decode("utf-8"))
         except Exception as e:
+            bus.error("Backup Decrypt", "Invalid backup file")
             return False, f"Invalid backup file: {e}", None
 
         if envelope.get("format_version") != BACKUP_FORMAT_VERSION:
+            bus.error("Backup Decrypt", "Unsupported backup format version")
             return False, "Unsupported backup format version", None
 
         enc = envelope.get("encryption", {})
@@ -600,8 +700,10 @@ class BackupService:
         nonce_b64 = enc.get("nonce")
         ct_b64 = envelope.get("ciphertext")
         if not salt_b64 or not nonce_b64 or not ct_b64:
+            bus.error("Backup Decrypt", "Missing encryption metadata")
             return False, "Missing encryption metadata", None
 
+        bus.info("Backup Decrypt", "Deriving decryption key...", step="Key Derive")
         salt = CryptoUtils.b64d(salt_b64)
         nonce = CryptoUtils.b64d(nonce_b64)
         ct = CryptoUtils.b64d(ct_b64)
@@ -609,28 +711,35 @@ class BackupService:
             mode, recovery_key_or_password, salt, skip_password_validation=True
         )
         if not enc_key:
+            bus.error("Backup Decrypt", "Key derivation failed")
             return False, "Key derivation failed", None
 
         stored_verifier = envelope.get("key_verifier")
         if stored_verifier:
             expected = CryptoUtils.hmac_sha256_hex(enc_key, b"backup_key_verifier")
             if not hmac.compare_digest(stored_verifier, expected):
+                bus.error("Backup Decrypt", "Invalid recovery key or password")
                 return False, "Invalid backup recovery key or password", None
 
+        bus.info("Backup Decrypt", "Decrypting backup...", step="Decrypt")
         try:
             from cryptography.hazmat.primitives.ciphers.aead import AESGCM
             plaintext = AESGCM(enc_key).decrypt(nonce, ct, b"sv_backup_recovery_v1")
         except Exception:
+            bus.error("Backup Decrypt", "Decryption failed (wrong key or corrupted data)")
             return False, "Decryption failed (wrong key or corrupted data)", None
 
         try:
             payload = json.loads(plaintext.decode("utf-8"))
         except Exception:
+            bus.error("Backup Decrypt", "Invalid payload structure")
             return False, "Invalid payload structure", None
 
         if payload.get("payload_format") != PAYLOAD_FORMAT or "entries" not in payload:
+            bus.error("Backup Decrypt", "Invalid payload format")
             return False, "Invalid payload format", None
 
+        bus.ok("Backup Decrypt", "Backup decrypted successfully")
         return True, "OK", payload
 
     def decrypt_backup_package_auto(
@@ -823,17 +932,28 @@ class BackupService:
         reason: str = "manual",
         recovery_key_or_password: Optional[str] = None,
         mode: Optional[str] = None,
+        cert_pem: Optional[bytes] = None,
     ) -> Tuple[bool, str]:
         """
         Create a versioned local backup in app backup dir. reason: 'manual'|'scheduled'|'change'.
         If recovery_key_or_password/mode are None, uses cached key from set_auto_backup_key_for_session.
+        cert_pem: If provided, corrupted entries will be auto-repaired during backup.
         Phase 5: in-progress guard prevents overlapping backups per user.
         """
+        bus = get_bus()
+        bus.info("Auto Backup", f"Creating local backup ({reason})...")
+        
         if self._backup_in_progress.get(user_id):
+            bus.warn("Auto Backup", "Backup already in progress - skipped")
             return False, "Backup already in progress"
         self._backup_in_progress[user_id] = True
         try:
-            return self._create_local_backup_now_impl(user_id, priv_key_data, reason, recovery_key_or_password, mode)
+            result = self._create_local_backup_now_impl(user_id, priv_key_data, reason, recovery_key_or_password, mode, cert_pem)
+            if result[0]:
+                bus.ok("Auto Backup", "Backup saved")
+            else:
+                bus.error("Auto Backup", f"Backup failed: {result[1]}")
+            return result
         finally:
             self._backup_in_progress.pop(user_id, None)
 
@@ -844,6 +964,7 @@ class BackupService:
         reason: str,
         recovery_key_or_password: Optional[str],
         mode: Optional[str],
+        cert_pem: Optional[bytes] = None,
     ) -> Tuple[bool, str]:
         if reason not in ("manual", "scheduled", "change_triggered"):
             reason = "manual"
@@ -854,7 +975,7 @@ class BackupService:
             if not cached:
                 return False, "Provide recovery key/password or set auto backup key for this session"
             key_or_pass, key_mode = cached
-        envelope, err = self._build_encrypted_envelope(user_id, priv_key_data, key_or_pass, key_mode)
+        envelope, err = self._build_encrypted_envelope(user_id, priv_key_data, key_or_pass, key_mode, cert_pem)
         if err:
             if reason != "manual":
                 self.audit.log_event("local_backup_failed", {"user_id": user_id, "reason": reason, "error": err}, user_id=user_id)

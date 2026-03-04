@@ -3,6 +3,7 @@ import datetime
 import io
 import json
 import os
+import hashlib
 import unicodedata
 from collections import Counter
 from pathlib import Path
@@ -17,6 +18,7 @@ from services.audit_log import AuditLog
 from services.crypto_utils import CryptoUtils
 from services.database import DBManager
 from services.structured_logger import get_logger
+from services.status_bus import get_bus
 
 
 class SecretService:
@@ -240,11 +242,16 @@ class SecretService:
 
     def add_secret(self, user_id, service, username, url, password, pub_key_pem, totp_secret=None):
         """Encrypt and store secret entry bound to owner's active encryption cert."""
+        bus = get_bus()
+        bus.info("Vault Add", "Validating entry metadata...")
+        
         valid, msg, cleaned = self._validate_metadata(service, username, url)
         if not valid:
+            bus.error("Vault Add", f"Validation failed: {msg}")
             return False, msg
 
         if not password:
+            bus.error("Vault Add", "Validation failed: Password required")
             return False, "Password cannot be empty"
 
         try:
@@ -270,8 +277,10 @@ class SecretService:
             exists = cursor.fetchone()
             conn.close()
             if exists:
+                bus.warn("Vault Add", "Duplicate entry detected - blocked")
                 return False, "Duplicate blocked by strict exact match (service+username+url+password)"
 
+            bus.info("Vault Add", "Encrypting data...", step="Encrypt")
             pub_key = self._resolve_owner_public_key(owner_id, pub_key_pem)
             aad = self._build_entry_aad(cleaned["service"], cleaned["username"], cleaned["canonical_url"])
             enc_dek, nonce, ciphertext = CryptoUtils.hybrid_encrypt(pub_key, str(password).encode("utf-8"), associated_data=aad)
@@ -329,9 +338,12 @@ class SecretService:
             conn.commit()
             conn.close()
 
+            bus.info("Vault Add", "Saving to vault...", step="Save")
             self.audit.log_event("SECRET_ADDED", {"user_id": user_id, "service": service}, user_id=user_id)
+            bus.ok("Vault Add", "Entry saved successfully")
             return True, "Secret added successfully"
         except Exception as e:
+            bus.error("Vault Add", "Failed to save entry")
             return False, f"Failed to add secret: {str(e)}"
 
     def get_secrets_metadata(self, user_id, search_query=None, sort_column="service_name", sort_direction="ASC"):
@@ -454,7 +466,160 @@ class SecretService:
         except Exception as e:
             return None, f"Decryption failed: {str(e)}"
 
+    def _is_likely_plaintext(self, data: bytes) -> bool:
+        """
+        Check if the data looks like plaintext rather than encrypted ciphertext.
+        Encrypted data should be binary/non-printable, while plaintext is human-readable.
+        """
+        if not data:
+            return False
+        try:
+            # If it's valid UTF-8 and mostly printable ASCII, it's likely plaintext
+            text = data.decode("utf-8")
+            if len(text) > 500:
+                return False  # Too long for a typical password
+            printable_ratio = sum(1 for c in text if c.isprintable() or c in "\n\r\t") / len(text)
+            return printable_ratio > 0.9
+        except (UnicodeDecodeError, ValueError):
+            return False
+
+    def get_raw_secret_data(self, user_id: int, entry_id: int):
+        """Get raw encrypted fields from database for diagnostics/repair."""
+        conn = self.db.get_connection()
+        try:
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT id, service_name, username_email, url, canonical_url,
+                       encrypted_password, encrypted_dek, nonce, crypto_version
+                FROM vault_secrets
+                WHERE id = ? AND owner_id = ?
+                """,
+                (int(entry_id), int(user_id)),
+            )
+            row = cursor.fetchone()
+            if not row:
+                return None
+            return dict(row)
+        finally:
+            conn.close()
+
+    def repair_corrupted_entry(self, user_id: int, entry_id: int, cert_pem: bytes) -> tuple:
+        """
+        Attempt to repair a corrupted entry by re-encrypting if plaintext is detected.
+        
+        Returns (success, message, repaired_password_or_none).
+        """
+        bus = get_bus()
+        bus.info("Vault Repair", f"Checking entry {entry_id}...")
+
+        raw = self.get_raw_secret_data(user_id, entry_id)
+        if not raw:
+            return False, "Entry not found", None
+
+        encrypted_password = raw.get("encrypted_password")
+        encrypted_dek = raw.get("encrypted_dek")
+        nonce = raw.get("nonce")
+
+        # Check if essential encryption fields are missing or malformed
+        if not encrypted_dek or not nonce:
+            # The password field might contain plaintext
+            if encrypted_password and self._is_likely_plaintext(encrypted_password):
+                plaintext_pwd = encrypted_password.decode("utf-8")
+                bus.info("Vault Repair", f"Entry {entry_id} has plaintext password - re-encrypting...")
+                
+                # Re-encrypt with proper hybrid encryption
+                try:
+                    pub_key = self._resolve_owner_public_key(user_id, cert_pem)
+                    service = raw.get("service_name", "")
+                    username = raw.get("username_email", "")
+                    canonical_url = raw.get("canonical_url", "")
+                    aad = self._build_entry_aad(service, username, canonical_url)
+                    
+                    enc_dek, new_nonce, ciphertext = CryptoUtils.hybrid_encrypt(
+                        pub_key, plaintext_pwd.encode("utf-8"), associated_data=aad
+                    )
+                    
+                    # Update database with properly encrypted data
+                    conn = self.db.get_connection()
+                    try:
+                        cursor = conn.cursor()
+                        cursor.execute(
+                            """
+                            UPDATE vault_secrets
+                            SET encrypted_password = ?, encrypted_dek = ?, nonce = ?, crypto_version = ?
+                            WHERE id = ? AND owner_id = ?
+                            """,
+                            (ciphertext, enc_dek, new_nonce, "v3-aead-envelope-aad", entry_id, user_id),
+                        )
+                        conn.commit()
+                    finally:
+                        conn.close()
+                    
+                    self.audit.log_event(
+                        "SECRET_REPAIRED",
+                        {"user_id": user_id, "entry_id": entry_id, "service": service},
+                        user_id=user_id,
+                    )
+                    bus.ok("Vault Repair", f"Entry {entry_id} repaired successfully")
+                    return True, "Entry repaired", plaintext_pwd
+                    
+                except Exception as e:
+                    bus.error("Vault Repair", f"Failed to repair entry {entry_id}: {e}")
+                    return False, f"Repair failed: {e}", None
+            else:
+                return False, "Entry has missing encryption fields and no recoverable plaintext", None
+        
+        # encrypted_dek and nonce exist but decryption still failed
+        # Check if encrypted_password itself might be plaintext (buggy save)
+        if encrypted_password and self._is_likely_plaintext(encrypted_password):
+            plaintext_pwd = encrypted_password.decode("utf-8")
+            bus.info("Vault Repair", f"Entry {entry_id} has plaintext in encrypted_password field - re-encrypting...")
+            
+            try:
+                pub_key = self._resolve_owner_public_key(user_id, cert_pem)
+                service = raw.get("service_name", "")
+                username = raw.get("username_email", "")
+                canonical_url = raw.get("canonical_url", "")
+                aad = self._build_entry_aad(service, username, canonical_url)
+                
+                enc_dek, new_nonce, ciphertext = CryptoUtils.hybrid_encrypt(
+                    pub_key, plaintext_pwd.encode("utf-8"), associated_data=aad
+                )
+                
+                conn = self.db.get_connection()
+                try:
+                    cursor = conn.cursor()
+                    cursor.execute(
+                        """
+                        UPDATE vault_secrets
+                        SET encrypted_password = ?, encrypted_dek = ?, nonce = ?, crypto_version = ?
+                        WHERE id = ? AND owner_id = ?
+                        """,
+                        (ciphertext, enc_dek, new_nonce, "v3-aead-envelope-aad", entry_id, user_id),
+                    )
+                    conn.commit()
+                finally:
+                    conn.close()
+                
+                self.audit.log_event(
+                    "SECRET_REPAIRED",
+                    {"user_id": user_id, "entry_id": entry_id, "service": service},
+                    user_id=user_id,
+                )
+                bus.ok("Vault Repair", f"Entry {entry_id} repaired successfully")
+                return True, "Entry repaired", plaintext_pwd
+                
+            except Exception as e:
+                bus.error("Vault Repair", f"Failed to repair entry {entry_id}: {e}")
+                return False, f"Repair failed: {e}", None
+        
+        return False, "Entry appears to be truly corrupted (not plaintext)", None
+
     def delete_secret(self, user_id, entry_id):
+        bus = get_bus()
+        bus.info("Vault Delete", "Deleting entry...")
+        
         conn = self.db.get_connection()
         cursor = conn.cursor()
         cursor.execute(
@@ -467,11 +632,15 @@ class SecretService:
 
         if deleted:
             self.audit.log_event("SECRET_DELETED", {"user_id": user_id, "entry_id": entry_id}, user_id=user_id)
+            bus.ok("Vault Delete", "Entry deleted")
             return True, "Secret deleted"
         return False, "Secret not found"
 
     def import_secrets_from_csv(self, user_id, csv_path, pub_key_pem, max_rows: int = 10000):
         """Import secrets from CSV with resilient header matching and continue-on-error."""
+        bus = get_bus()
+        bus.info("Import CSV", "Parsing CSV file...", step="Parse")
+        
         added = 0
         skipped = 0
         failed = 0
@@ -479,6 +648,7 @@ class SecretService:
 
         path = Path(csv_path)
         if not path.exists():
+            bus.error("Import CSV", "CSV file not found")
             return False, {"error": "CSV file not found"}
 
         try:
@@ -596,6 +766,7 @@ class SecretService:
                 user_id=user_id,
             )
 
+            bus.ok("Import CSV", f"Import complete: {added} entries added, {skipped} skipped")
             return True, {
                 "added": added,
                 "imported": added,
@@ -608,19 +779,25 @@ class SecretService:
         except UnicodeDecodeError as e:
             error_detail = f"File encoding error. Please ensure the CSV file is UTF-8 encoded. Error: {str(e)}"
             self._logger.error("CSV import encoding error: %s", e)
+            bus.error("Import CSV", "Failed: File encoding error")
             return False, {"error": error_detail, "message": error_detail}
         except csv.Error as e:
             error_detail = f"CSV parsing error: {str(e)}. Please check the CSV file format."
             self._logger.error("CSV import parsing error: %s", e)
+            bus.error("Import CSV", "Failed: CSV parsing error")
             return False, {"error": error_detail, "message": error_detail}
         except Exception as e:
             import traceback
             error_detail = f"Import error: {str(e)}"
             self._logger.error("CSV import exception: %s\n%s", error_detail, traceback.format_exc())
+            bus.error("Import CSV", "Import failed")
             return False, {"error": error_detail, "message": error_detail}
 
     def import_secrets_from_json(self, user_id, json_path, pub_key_pem, max_rows: int = 10000):
         """Import secrets from JSON file (browser exports like Firefox, Chrome, etc.)."""
+        bus = get_bus()
+        bus.info("Import JSON", "Parsing JSON file...", step="Parse")
+        
         added = 0
         skipped = 0
         failed = 0
@@ -628,6 +805,7 @@ class SecretService:
 
         path = Path(json_path)
         if not path.exists():
+            bus.error("Import JSON", "JSON file not found")
             return False, {"error": "JSON file not found"}
 
         try:
@@ -746,6 +924,7 @@ class SecretService:
                 user_id=user_id,
             )
 
+            bus.ok("Import JSON", f"Import complete: {added} entries added, {skipped} skipped")
             return True, {
                 "added": added,
                 "imported": added,
@@ -758,15 +937,18 @@ class SecretService:
         except json.JSONDecodeError as e:
             error_detail = f"Invalid JSON format: {str(e)}"
             self._logger.error("JSON import parsing error: %s", e)
+            bus.error("Import JSON", "Failed: Invalid JSON format")
             return False, {"error": error_detail, "message": error_detail}
         except UnicodeDecodeError as e:
             error_detail = f"File encoding error. Please ensure the JSON file is UTF-8 encoded. Error: {str(e)}"
             self._logger.error("JSON import encoding error: %s", e)
+            bus.error("Import JSON", "Failed: File encoding error")
             return False, {"error": error_detail, "message": error_detail}
         except Exception as e:
             import traceback
             error_detail = f"Import error: {str(e)}"
             self._logger.error("JSON import exception: %s\n%s", error_detail, traceback.format_exc())
+            bus.error("Import JSON", "Import failed")
             return False, {"error": error_detail, "message": error_detail}
 
     @staticmethod
@@ -1151,10 +1333,15 @@ class SecretService:
 
     def export_secrets_as_csv(self, user_id, priv_key_data):
         """Decrypt all secrets and return them as a CSV string."""
+        bus = get_bus()
+        bus.info("Export CSV", "Preparing export...")
+        
         secrets_meta = self.get_secrets_metadata(user_id)
         if not secrets_meta:
+            bus.ok("Export CSV", "No entries to export")
             return ""
 
+        bus.info("Export CSV", f"Exporting {len(secrets_meta)} entries...", step="Decrypt")
         output = io.StringIO()
         # Use headers that are compatible with our own importer
         writer = csv.DictWriter(output, fieldnames=["service", "username", "password", "url", "totp_secret"])
@@ -1173,14 +1360,20 @@ class SecretService:
                     "totp_secret": totp
                 })
         
+        bus.ok("Export CSV", f"Export complete: {len(secrets_meta)} entries")
         return output.getvalue()
 
     def export_secrets_as_json(self, user_id, priv_key_data):
         """Decrypt all secrets and return them as a JSON string."""
+        bus = get_bus()
+        bus.info("Export JSON", "Preparing export...")
+        
         secrets_meta = self.get_secrets_metadata(user_id)
         if not secrets_meta:
+            bus.ok("Export JSON", "No entries to export")
             return json.dumps([], indent=2)
         
+        bus.info("Export JSON", f"Exporting {len(secrets_meta)} entries...", step="Decrypt")
         entries = []
         for meta in secrets_meta:
             res, msg = self.decrypt_secret(user_id, meta["id"], priv_key_data)
@@ -1196,4 +1389,209 @@ class SecretService:
                     "created_at": meta.get("created_at", "")
                 })
         
+        bus.ok("Export JSON", f"Export complete: {len(entries)} entries")
         return json.dumps(entries, indent=2, ensure_ascii=False)
+
+    # ───────────────────────────────────────────────────────────────────────────
+    # SIGNED EXPORTS (PASSWORD TAB)
+    # ───────────────────────────────────────────────────────────────────────────
+
+    def _build_export_signature_bundle(self, user_id: int, payload_bytes: bytes, signing_priv_key_data: bytes):
+        """
+        Create a detached RSA-PSS(SHA-256) signature bundle for a vault export.
+
+        The bundle is a JSON-serialisable dict that does NOT contain any cleartext
+        passwords – only a hash of the export and certificate metadata.
+        """
+        bus = get_bus()
+        bus.info("Export Sign", "Preparing signing key...", step="Init")
+
+        private_key = CryptoUtils.load_private_key(signing_priv_key_data)
+
+        conn = None
+        try:
+            conn = self.db.get_connection()
+            cursor = conn.cursor()
+            cursor.execute(
+                """
+                SELECT serial_number, cert_data
+                FROM certificates
+                WHERE user_id = ? AND key_usage = 'signing' AND revoked = 0
+                ORDER BY id DESC
+                LIMIT 1
+                """,
+                (int(user_id),),
+            )
+            row = cursor.fetchone()
+            if not row:
+                bus.error("Export Sign", "No active signing certificate found")
+                return False, "No active signing certificate found", None
+
+            cert_serial = row["serial_number"]
+            cert_pem = row["cert_data"]
+            cert_bytes = cert_pem.encode() if isinstance(cert_pem, str) else cert_pem
+
+            # Validate certificate for signing usage (no secrets in messages)
+            bus.info("Export Sign", "Validating signing certificate...", step="Validate")
+            valid, msg = self.pki.validate_certificate(
+                cert_bytes,
+                db_manager=self.db,
+                required_ku=["digital_signature", "content_commitment"],
+            )
+            if not valid:
+                bus.error("Export Sign", "Signing certificate validation failed")
+                return False, f"Signing certificate validation failed: {msg}", None
+
+            # Compute hash of payload and sign the hash
+            bus.info("Export Sign", "Computing SHA-256 hash...", step="Hash")
+            payload_hash = hashlib.sha256(payload_bytes).digest()
+            payload_hash_hex = payload_hash.hex()
+
+            bus.info("Export Sign", "Signing export bundle...", step="Signing")
+            signature = CryptoUtils.sign_data(private_key, payload_hash)
+
+            bundle = {
+                "bundle_format": "sv_vault_export_sig_v1",
+                "user_id": int(user_id),
+                "hash_alg": "SHA-256",
+                "payload_hash": payload_hash_hex,
+                "signature": CryptoUtils.b64e(signature),
+                "cert_serial": cert_serial,
+                "cert_pem": cert_pem,
+                "created_at": datetime.datetime.utcnow().replace(microsecond=0).isoformat() + "Z",
+            }
+
+            bus.ok("Export Sign", "Export signed successfully")
+            return True, "Export signed", bundle
+        except Exception as e:
+            bus.error("Export Sign", "Signing failed")
+            return False, f"Export signing failed: {e}", None
+        finally:
+            if conn:
+                conn.close()
+
+    def export_signed_secrets_as_csv(self, user_id: int, priv_key_data: bytes, signing_priv_key_data: bytes):
+        """
+        Export vault as cleartext CSV AND create a detached signature bundle.
+
+        Returns (ok, message, csv_string, signature_bundle_dict).
+        """
+        # First generate the plain CSV (existing behaviour)
+        csv_data = self.export_secrets_as_csv(user_id, priv_key_data)
+        if not csv_data:
+            return False, "Vault is empty", "", None
+
+        ok, msg, bundle = self._build_export_signature_bundle(
+            user_id,
+            csv_data.encode("utf-8"),
+            signing_priv_key_data,
+        )
+        return ok, msg, csv_data, bundle
+
+    def export_signed_secrets_as_json(self, user_id: int, priv_key_data: bytes, signing_priv_key_data: bytes):
+        """
+        Export vault as cleartext JSON AND create a detached signature bundle.
+
+        Returns (ok, message, json_string, signature_bundle_dict).
+        """
+        json_data = self.export_secrets_as_json(user_id, priv_key_data)
+        if not json_data or json_data == "[]":
+            return False, "Vault is empty", "", None
+
+        ok, msg, bundle = self._build_export_signature_bundle(
+            user_id,
+            json_data.encode("utf-8"),
+            signing_priv_key_data,
+        )
+        return ok, msg, json_data, bundle
+
+    def verify_export_signature(self, payload_bytes: bytes, bundle: dict):
+        """
+        Verify a signed export bundle against a payload.
+
+        Returns (ok, result_dict) where result_dict contains:
+          - status: "valid" | "invalid"
+          - reason: human-readable message
+          - hash_matches: bool
+          - signature_valid: bool
+          - cert_valid: bool
+          - bundle_format, hash_alg, cert_serial, created_at (if available)
+        """
+        from cryptography import x509
+
+        result = {
+            "status": "invalid",
+            "reason": "",
+            "hash_matches": False,
+            "signature_valid": False,
+            "cert_valid": False,
+            "bundle_format": bundle.get("bundle_format"),
+            "hash_alg": bundle.get("hash_alg"),
+            "cert_serial": bundle.get("cert_serial"),
+            "created_at": bundle.get("created_at"),
+        }
+
+        try:
+            if bundle.get("bundle_format") != "sv_vault_export_sig_v1":
+                result["reason"] = "Unsupported signature bundle format"
+                return False, result
+
+            if bundle.get("hash_alg") != "SHA-256":
+                result["reason"] = "Unsupported hash algorithm"
+                return False, result
+
+            expected_hash_hex = str(bundle.get("payload_hash") or "")
+            if not expected_hash_hex:
+                result["reason"] = "Missing payload hash in bundle"
+                return False, result
+
+            # Recompute hash over the provided payload
+            actual_hash_hex = hashlib.sha256(payload_bytes).hexdigest()
+            result["hash_matches"] = (actual_hash_hex == expected_hash_hex)
+            if not result["hash_matches"]:
+                result["reason"] = "Payload hash does not match bundle"
+                return False, result
+
+            # Verify signature with the embedded certificate
+            cert_pem = bundle.get("cert_pem")
+            sig_b64 = bundle.get("signature")
+            if not cert_pem or not sig_b64:
+                result["reason"] = "Missing certificate or signature in bundle"
+                return False, result
+
+            cert_bytes = cert_pem.encode() if isinstance(cert_pem, str) else cert_pem
+            cert_obj = x509.load_pem_x509_certificate(cert_bytes)
+            signature = CryptoUtils.b64d(sig_b64)
+
+            sig_ok = CryptoUtils.verify_signature(
+                cert_obj.public_key(),
+                bytes.fromhex(expected_hash_hex),
+                signature,
+            )
+            result["signature_valid"] = bool(sig_ok)
+            if not sig_ok:
+                result["reason"] = "Signature verification failed"
+                return False, result
+
+            # Optionally validate certificate against current PKI state (if DB present)
+            try:
+                valid, msg = self.pki.validate_certificate(
+                    cert_bytes,
+                    db_manager=self.db,
+                    required_ku=["digital_signature", "content_commitment"],
+                )
+                result["cert_valid"] = bool(valid)
+                if not valid:
+                    result["reason"] = f"Certificate validation failed: {msg}"
+                    # Still treat as cryptographically valid, but flag status
+                    return False, result
+            except Exception:
+                # If PKI validation fails unexpectedly, keep cryptographic result only
+                result["cert_valid"] = False
+
+            result["status"] = "valid"
+            result["reason"] = "Export file and signature are valid"
+            return True, result
+        except Exception as e:
+            result["reason"] = f"Verification failed: {e}"
+            return False, result
