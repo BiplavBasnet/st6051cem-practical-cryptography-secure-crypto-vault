@@ -4494,7 +4494,12 @@ class VaultTkApp:
             command=_cancel,
         ).pack(side="left")
 
-        pass_entry.focus_set()
+        # Focus the password entry (first child of pass_row frame)
+        try:
+            pass_entry = pass_row.winfo_children()[0]
+            pass_entry.focus_set()
+        except (IndexError, AttributeError):
+            pass
 
     def _execute_key_rotation(self, popup, login_pass, recovery_pass, status_var, rotate_btn):
         """Execute the key rotation process."""
@@ -7635,12 +7640,19 @@ class VaultTkApp:
         self.audit_details_text.delete("1.0", "end")
         self.audit_details_text.configure(state="disabled")
         self.audit_log_data = []
+        
+        # SECURITY: Only show logs for the current logged-in user
+        if not self.session or not self.session.get("user_id"):
+            self.audit_log_table.insert("", "end", values=("—", "—", "—", "—", "Please log in to view your activity log."), tags=("empty",))
+            return
+        
+        current_user_id = int(self.session["user_id"])
+        
         try:
             since_ts, until_ts = self._get_activity_log_date_range()
             sort_by = self.audit_sort_var.get() or "Time"
             sort_map = {"Time": "created_at", "Category": "category", "Status": "status", "Action": "action"}
             sort_key = sort_map.get(sort_by, "created_at")
-            current_user_id = int(self.session["user_id"]) if self.session and self.session.get("user_id") else None
             rows = self.api.list_audit_logs(
                 limit=500,
                 since_ts=since_ts,
@@ -7650,7 +7662,7 @@ class VaultTkApp:
                 search=self.audit_search_var.get().strip() or None,
                 sort_by=sort_key,
                 sort_desc=self.audit_sort_desc_var.get(),
-                user_id=current_user_id,
+                user_id=current_user_id,  # STRICT: Always filter by current user only
                 include_system=bool(getattr(self, "audit_include_system_var", None) and self.audit_include_system_var.get()),
             )
             self.audit_log_data = rows

@@ -94,19 +94,27 @@ class AuditLog:
         user_id: Optional[int] = None,
         include_system: bool = False,
     ) -> List[Dict[str, Any]]:
-        """Read audit log rows for the viewer. When user_id is set, only events for that user (and optionally system) are returned."""
+        """Read audit log rows for the viewer.
+        
+        SECURITY: user_id is REQUIRED. If not provided, returns empty list.
+        Users can only view their own activity logs.
+        """
+        # STRICT SECURITY: Require user_id to prevent viewing other users' logs
+        if user_id is None:
+            return []
+        
         conn = self.db.get_connection()
         try:
             cursor = conn.cursor()
             where_parts = []
             params: List[Any] = []
-            if user_id is not None:
-                if include_system:
-                    where_parts.append("(user_id = ? OR user_id IS NULL)")
-                    params.append(user_id)
-                else:
-                    where_parts.append("user_id = ?")
-                    params.append(user_id)
+            # Always filter by user_id (required for security)
+            if include_system:
+                where_parts.append("(user_id = ? OR user_id IS NULL)")
+                params.append(user_id)
+            else:
+                where_parts.append("user_id = ?")
+                params.append(user_id)
             if since_ts:
                 where_parts.append("created_at >= ?")
                 params.append(since_ts)
