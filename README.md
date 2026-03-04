@@ -40,12 +40,15 @@ A forensic-grade, enterprise-level password manager and secure document vault bu
 - **Brute-Force Protection**: Progressive backoff with lockout controls
 - **Audit Logging**: Tamper-evident, hash-chained security logs
 - **Digital Signatures**: Sign and verify documents with PKI
+- **Certificate Management**: View, manage, and revoke X.509 certificates
+- **Secure Delete**: Always requires password confirmation for deletions
 
 ### Advanced Cryptography
 - **Zero-Knowledge Architecture**: Master password never stored
 - **Forward Secrecy**: ECDH key agreement for session keys
 - **Certificate-Based Auth**: X.509 PKI with challenge-response
-- **Key Rotation**: Seamless credential re-encryption
+- **Key Rotation**: UI-driven key rotation with automatic certificate revocation
+- **Auto-Repair**: Automatic detection and repair of corrupted vault entries during backup
 
 ---
 
@@ -241,6 +244,8 @@ This launches the full graphical interface with:
 - Password vault management
 - Settings and preferences
 - Backup and restore
+- Key rotation and certificate management
+- Signed export with verification
 
 ### Installing the Browser Extension
 
